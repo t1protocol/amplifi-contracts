@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
-import {AmplifiLendingPool, PoolStatus} from "../src/AmplifiLendingPool.sol";
+import {AmplifiLendingPool, PoolStatus, ZeroAddress} from "../src/AmplifiLendingPool.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MockUSDC is ERC20 {
@@ -26,6 +26,10 @@ contract MockToken is ERC20 {
 
     function decimals() public view override returns (uint8) {
         return DECIMALS;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
     }
 }
 
@@ -685,6 +689,37 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(p.symbol(), "aWETH");
         assertEq(p.decimals(), 18);
         assertEq(p.asset(), address(weth));
+
+        // A full round trip at 1e18 scale: supply, borrow, accrue, repay, redeem.
+        weth.mint(lender1, 100 ether);
+        vm.startPrank(lender1);
+        weth.approve(address(p), 100 ether);
+        uint256 shares = p.deposit(100 ether, lender1);
+        vm.stopPrank();
+        assertEq(shares, 100 ether);
+
+        vm.prank(teeOperator);
+        p.borrow(1, 40 ether, borrowerWallet);
+        assertEq(weth.balanceOf(borrowerWallet), 40 ether);
+        vm.warp(block.timestamp + 365 days);
+        uint256 debt = p.loanDebt(1);
+        assertGt(debt, 40 ether);
+        weth.mint(borrowerWallet, debt - 40 ether);
+        vm.startPrank(borrowerWallet);
+        weth.transfer(address(p), debt);
+        p.repay(1, debt);
+        vm.stopPrank();
+        assertEq(p.loanDebt(1), 0);
+
+        vm.prank(lender1);
+        uint256 out = p.redeem(shares, lender1, lender1);
+        assertGt(out, 100 ether);
+        assertEq(weth.balanceOf(lender1), out);
+    }
+
+    function test_constructorRejectsZeroAsset() public {
+        vm.expectRevert(ZeroAddress.selector);
+        new AmplifiLendingPool(address(0), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
     }
 
     // ── ERC-4626 View Functions ─────────────────────────────────────────

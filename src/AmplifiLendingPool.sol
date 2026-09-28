@@ -16,10 +16,16 @@ enum PoolStatus {
     Closed
 }
 
+error ZeroAddress();
+
 /// @dev The share token is named after the asset it holds, and carries the asset's
 ///      decimals (the ERC-4626 convention), so one build serves a pUSD pool on Polygon
-///      ("apUSD", 6) and a USDG or WETH pool elsewhere ("aUSDG" 6, "aWETH" 18).
+///      ("apUSD", 6) and a USDG or WETH pool elsewhere ("aUSDG" 6, "aWETH" 18). The asset
+///      must expose a string `symbol()` and `decimals()`; one that does not (a bytes32
+///      symbol, say) reverts here, at deploy time. These run as base-constructor arguments,
+///      before the constructor body, so the zero-asset check lives here too.
 function shareName(address asset) view returns (string memory) {
+    if (asset == address(0)) revert ZeroAddress();
     return string.concat("Amplifi ", IERC20Metadata(asset).symbol(), " Lending Share");
 }
 
@@ -129,7 +135,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error ZeroShares();
     error InvalidRateParams();
     error InvalidStatusTransition();
-    error ZeroAddress();
     error LoanAlreadyExists();
     error LoanNotFound();
     error WalletNotAllowed();
