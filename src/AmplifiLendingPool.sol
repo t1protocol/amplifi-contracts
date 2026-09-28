@@ -16,11 +16,23 @@ enum PoolStatus {
     Closed
 }
 
+/// @dev The share token is named after the asset it holds, and carries the asset's
+///      decimals (the ERC-4626 convention), so one build serves a pUSD pool on Polygon
+///      ("apUSD", 6) and a USDG or WETH pool elsewhere ("aUSDG" 6, "aWETH" 18).
+function shareName(address asset) view returns (string memory) {
+    return string.concat("Amplifi ", IERC20Metadata(asset).symbol(), " Lending Share");
+}
+
+function shareSymbol(address asset) view returns (string memory) {
+    return string.concat("a", IERC20Metadata(asset).symbol());
+}
+
 contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ── Immutables ──────────────────────────────────────────────────────
     IERC20 public immutable usdc;
+    uint8 private immutable SHARE_DECIMALS;
 
     // ── State ───────────────────────────────────────────────────────────
     address public teeOperator;
@@ -147,10 +159,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 _kinkUtilizationBps,
         uint256 _kinkRateBps,
         uint256 _maxRateBps
-    ) ERC20("Amplifi pUSD Lending Share", "apUSD") Ownable(_owner) {
+    ) ERC20(shareName(_usdc), shareSymbol(_usdc)) Ownable(_owner) {
         if (_usdc == address(0)) revert ZeroAddress();
         if (_teeOperator == address(0)) revert ZeroAddress();
         usdc = IERC20(_usdc);
+        SHARE_DECIMALS = IERC20Metadata(_usdc).decimals();
         teeOperator = _teeOperator;
         baseRateBps = _baseRateBps;
         kinkUtilizationBps = _kinkUtilizationBps;
@@ -162,8 +175,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     // ── ERC20 / IERC20Metadata Override ─────────────────────────────────
-    function decimals() public pure override(ERC20, IERC20Metadata) returns (uint8) {
-        return 6;
+    function decimals() public view override(ERC20, IERC20Metadata) returns (uint8) {
+        return SHARE_DECIMALS;
     }
 
     // ── ERC-4626 ────────────────────────────────────────────────────────

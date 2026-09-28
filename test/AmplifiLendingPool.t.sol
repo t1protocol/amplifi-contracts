@@ -17,6 +17,18 @@ contract MockUSDC is ERC20 {
     }
 }
 
+contract MockToken is ERC20 {
+    uint8 private immutable DECIMALS;
+
+    constructor(string memory symbol_, uint8 decimals_) ERC20(symbol_, symbol_) {
+        DECIMALS = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return DECIMALS;
+    }
+}
+
 contract AmplifiLendingPoolTest is Test {
     AmplifiLendingPool pool;
     MockUSDC usdc;
@@ -647,8 +659,9 @@ contract AmplifiLendingPoolTest is Test {
     // ── ERC20 Properties ────────────────────────────────────────────────
 
     function test_shareToken_properties() public view {
-        assertEq(pool.name(), "Amplifi pUSD Lending Share");
-        assertEq(pool.symbol(), "apUSD");
+        // Named after the underlying, with its decimals: the mock is "USDC" with 6.
+        assertEq(pool.name(), "Amplifi USDC Lending Share");
+        assertEq(pool.symbol(), "aUSDC");
         assertEq(pool.decimals(), 6);
     }
 
@@ -662,6 +675,16 @@ contract AmplifiLendingPoolTest is Test {
 
         assertEq(pool.balanceOf(lender1), shares / 2);
         assertEq(pool.balanceOf(lender2), shares / 2);
+    }
+
+    function test_shareToken_followsAnUnderlyingWith18Decimals() public {
+        MockToken weth = new MockToken("WETH", 18);
+        AmplifiLendingPool p =
+            new AmplifiLendingPool(address(weth), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        assertEq(p.name(), "Amplifi WETH Lending Share");
+        assertEq(p.symbol(), "aWETH");
+        assertEq(p.decimals(), 18);
+        assertEq(p.asset(), address(weth));
     }
 
     // ── ERC-4626 View Functions ─────────────────────────────────────────
