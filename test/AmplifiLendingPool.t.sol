@@ -699,13 +699,17 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(shares, 100 ether);
 
         vm.prank(teeOperator);
-        p.borrow(1, 40 ether, borrowerWallet);
-        assertEq(weth.balanceOf(borrowerWallet), 40 ether);
+        p.borrow(1, 40 ether, borrower);
+        assertEq(weth.balanceOf(borrower), 40 ether);
         vm.warp(block.timestamp + 365 days);
         uint256 debt = p.loanDebt(1);
-        assertGt(debt, 40 ether);
-        weth.mint(borrowerWallet, debt - 40 ether);
-        vm.startPrank(borrowerWallet);
+        // 40 of 100 lent is 40% utilisation, under the 85% kink, so the rate
+        // is the base plus 40/85 of the way to the kink rate: a year of that
+        // on 40 ether is a little over 4 ether of interest.
+        assertGt(debt, 44 ether);
+        assertLt(debt, 45 ether);
+        weth.mint(borrower, debt - 40 ether);
+        vm.startPrank(borrower);
         weth.transfer(address(p), debt);
         p.repay(1, debt);
         vm.stopPrank();
@@ -1418,7 +1422,7 @@ contract AmplifiLendingPoolTest is Test {
 
     function test_setAllowedBorrowerWallet_zeroAddr_reverts() public {
         vm.prank(owner);
-        vm.expectRevert(AmplifiLendingPool.ZeroAddress.selector);
+        vm.expectRevert(ZeroAddress.selector);
         pool.setAllowedBorrowerWallet(address(0), true);
     }
 

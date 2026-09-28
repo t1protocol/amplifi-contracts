@@ -37,6 +37,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ── Immutables ──────────────────────────────────────────────────────
+    // The asset. Named for the first deploy and kept for the ABI; asset() is
+    // the ERC-4626 name for the same address.
     IERC20 public immutable usdc;
     uint8 private immutable SHARE_DECIMALS;
 
@@ -165,7 +167,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 _kinkRateBps,
         uint256 _maxRateBps
     ) ERC20(shareName(_usdc), shareSymbol(_usdc)) Ownable(_owner) {
-        if (_usdc == address(0)) revert ZeroAddress();
+        // A zero asset already reverted in shareName, before this body ran.
         if (_teeOperator == address(0)) revert ZeroAddress();
         usdc = IERC20(_usdc);
         SHARE_DECIMALS = IERC20Metadata(_usdc).decimals();
