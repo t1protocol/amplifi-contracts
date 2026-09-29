@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
-import {AmplifiLendingPool, PoolStatus} from "../src/AmplifiLendingPool.sol";
+import {AmplifiLendingPool, PoolStatus, ZeroAddress} from "../src/AmplifiLendingPool.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MockUSDC is ERC20 {
@@ -10,6 +10,22 @@ contract MockUSDC is ERC20 {
 
     function decimals() public pure override returns (uint8) {
         return 6;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+contract MockToken is ERC20 {
+    uint8 private immutable DECIMALS;
+
+    constructor(string memory symbol_, uint8 decimals_) ERC20(symbol_, symbol_) {
+        DECIMALS = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return DECIMALS;
     }
 
     function mint(address to, uint256 amount) external {
@@ -647,8 +663,9 @@ contract AmplifiLendingPoolTest is Test {
     // ── ERC20 Properties ────────────────────────────────────────────────
 
     function test_shareToken_properties() public view {
-        assertEq(pool.name(), "Amplifi pUSD Lending Share");
-        assertEq(pool.symbol(), "apUSD");
+        // Named after the underlying, with its decimals: the mock is "USDC" with 6.
+        assertEq(pool.name(), "Amplifi USDC Lending Share");
+        assertEq(pool.symbol(), "aUSDC");
         assertEq(pool.decimals(), 6);
     }
 
@@ -662,6 +679,51 @@ contract AmplifiLendingPoolTest is Test {
 
         assertEq(pool.balanceOf(lender1), shares / 2);
         assertEq(pool.balanceOf(lender2), shares / 2);
+    }
+
+    function test_shareToken_followsAnUnderlyingWith18Decimals() public {
+        MockToken weth = new MockToken("WETH", 18);
+        AmplifiLendingPool p =
+            new AmplifiLendingPool(address(weth), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        assertEq(p.name(), "Amplifi WETH Lending Share");
+        assertEq(p.symbol(), "aWETH");
+        assertEq(p.decimals(), 18);
+        assertEq(p.asset(), address(weth));
+
+        // A full round trip at 1e18 scale: supply, borrow, accrue, repay, redeem.
+        weth.mint(lender1, 100 ether);
+        vm.startPrank(lender1);
+        weth.approve(address(p), 100 ether);
+        uint256 shares = p.deposit(100 ether, lender1);
+        vm.stopPrank();
+        assertEq(shares, 100 ether);
+
+        vm.prank(teeOperator);
+        p.borrow(1, 40 ether, borrower);
+        assertEq(weth.balanceOf(borrower), 40 ether);
+        vm.warp(block.timestamp + 365 days);
+        uint256 debt = p.loanDebt(1);
+        // 40 of 100 lent is 40% utilisation, under the 85% kink, so the rate
+        // is the base plus 40/85 of the way to the kink rate: a year of that
+        // on 40 ether is a little over 4 ether of interest.
+        assertGt(debt, 44 ether);
+        assertLt(debt, 45 ether);
+        weth.mint(borrower, debt - 40 ether);
+        vm.startPrank(borrower);
+        weth.transfer(address(p), debt);
+        p.repay(1, debt);
+        vm.stopPrank();
+        assertEq(p.loanDebt(1), 0);
+
+        vm.prank(lender1);
+        uint256 out = p.redeem(shares, lender1, lender1);
+        assertGt(out, 100 ether);
+        assertEq(weth.balanceOf(lender1), out);
+    }
+
+    function test_constructorRejectsZeroAsset() public {
+        vm.expectRevert(ZeroAddress.selector);
+        new AmplifiLendingPool(address(0), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
     }
 
     // ── ERC-4626 View Functions ─────────────────────────────────────────
@@ -1360,7 +1422,7 @@ contract AmplifiLendingPoolTest is Test {
 
     function test_setAllowedBorrowerWallet_zeroAddr_reverts() public {
         vm.prank(owner);
-        vm.expectRevert(AmplifiLendingPool.ZeroAddress.selector);
+        vm.expectRevert(ZeroAddress.selector);
         pool.setAllowedBorrowerWallet(address(0), true);
     }
 
