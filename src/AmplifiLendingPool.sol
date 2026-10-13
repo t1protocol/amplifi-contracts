@@ -84,6 +84,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     bool public borrowAllowlistEnabled;
     mapping(address wallet => bool allowed) public allowedBorrowerWallet;
 
+    // Optional depositor whitelist. While nobody is on it (count 0) anyone can deposit;
+    // once an address is added, only whitelisted callers can deposit or mint. Withdrawals
+    // are never restricted.
+    mapping(address depositor => bool whitelisted) public isDepositorWhitelisted;
+    uint256 public depositorWhitelistCount;
+
     // Borrow circuit breakers (0 = disabled). `maxBorrowPerLoan` caps a single borrow;
     // `maxBorrowPerWindow` caps cumulative borrows inside a rolling `borrowWindow`
     // (tumbling), bounding how much a compromised operator can drain in one burst before
@@ -122,6 +128,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event PoolStatusUpdated(PoolStatus oldStatus, PoolStatus newStatus);
     event BorrowAllowlistEnabledUpdated(bool enabled);
     event AllowedBorrowerWalletUpdated(address indexed wallet, bool allowed);
+    event DepositorWhitelistUpdated(address indexed depositor, bool whitelisted);
     event BorrowCapsUpdated(uint256 maxBorrowPerLoan, uint256 maxBorrowPerWindow, uint256 borrowWindow);
     event ProtocolFeeUpdated(uint256 feeBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
@@ -140,6 +147,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error LoanAlreadyExists();
     error LoanNotFound();
     error WalletNotAllowed();
+    error DepositorNotWhitelisted();
     error BorrowCapExceeded();
     error InvalidBorrowCaps();
     error InvalidFeeParams();
@@ -200,6 +208,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function deposit(uint256 assets, address receiver) public nonReentrant whenActive returns (uint256 shares) {
+        _checkDepositor(msg.sender);
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -214,6 +223,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function mint(uint256 shares, address receiver) external nonReentrant whenActive returns (uint256 assets) {
+        _checkDepositor(msg.sender);
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -460,12 +470,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── ERC-4626 View Functions ──────────────────────────────────────────
 
-    function maxDeposit(address) external view returns (uint256) {
-        return status == PoolStatus.Active ? type(uint256).max : 0;
+    function maxDeposit(address depositor) external view returns (uint256) {
+        return status == PoolStatus.Active && _canDeposit(depositor) ? type(uint256).max : 0;
     }
 
-    function maxMint(address) external view returns (uint256) {
-        return status == PoolStatus.Active ? type(uint256).max : 0;
+    function maxMint(address depositor) external view returns (uint256) {
+        return status == PoolStatus.Active && _canDeposit(depositor) ? type(uint256).max : 0;
     }
 
     function maxWithdraw(address _owner) external view returns (uint256) {
@@ -557,6 +567,36 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (wallet == address(0)) revert ZeroAddress();
         allowedBorrowerWallet[wallet] = allowed;
         emit AllowedBorrowerWalletUpdated(wallet, allowed);
+    }
+
+    /// @notice Add or remove a depositor. Removing the last one reopens deposits to anyone.
+    function setDepositorWhitelisted(address depositor, bool whitelisted) external onlyOwner {
+        _setDepositorWhitelisted(depositor, whitelisted);
+    }
+
+    /// @notice Batch variant of setDepositorWhitelisted.
+    function setDepositorsWhitelisted(address[] calldata depositors, bool whitelisted) external onlyOwner {
+        uint256 len = depositors.length;
+        for (uint256 i; i < len; ++i) {
+            _setDepositorWhitelisted(depositors[i], whitelisted);
+        }
+    }
+
+    function _setDepositorWhitelisted(address depositor, bool whitelisted) internal {
+        if (depositor == address(0)) revert ZeroAddress();
+        if (isDepositorWhitelisted[depositor] == whitelisted) return;
+        isDepositorWhitelisted[depositor] = whitelisted;
+        if (whitelisted) ++depositorWhitelistCount;
+        else --depositorWhitelistCount;
+        emit DepositorWhitelistUpdated(depositor, whitelisted);
+    }
+
+    function _canDeposit(address depositor) internal view returns (bool) {
+        return depositorWhitelistCount == 0 || isDepositorWhitelisted[depositor];
+    }
+
+    function _checkDepositor(address depositor) internal view {
+        if (!_canDeposit(depositor)) revert DepositorNotWhitelisted();
     }
 
     /// @notice Batch variant of setAllowedBorrowerWallet, set the same `allowed` flag for many wallets.

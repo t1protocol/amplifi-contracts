@@ -1315,6 +1315,120 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.loanShares(1), 10_000_000);
     }
 
+    // ── Depositor whitelist ─────────────────────────────────────────────
+
+    function _whitelist(address depositor, bool whitelisted) internal {
+        vm.prank(owner);
+        pool.setDepositorWhitelisted(depositor, whitelisted);
+    }
+
+    function _fundAndApprove(address who, uint256 amount) internal {
+        usdc.mint(who, amount);
+        vm.prank(who);
+        usdc.approve(address(pool), amount);
+    }
+
+    function test_depositorWhitelist_emptyMeansAnyoneCanDeposit() public {
+        assertEq(pool.depositorWhitelistCount(), 0);
+        _depositAs(lender1, 1_000_000);
+        _fundAndApprove(lender2, 1_000_000);
+        vm.prank(lender2);
+        pool.mint(1_000_000, lender2);
+        assertGt(pool.balanceOf(lender1), 0);
+        assertGt(pool.balanceOf(lender2), 0);
+    }
+
+    function test_depositorWhitelist_onlyListedCanDepositOrMint() public {
+        _whitelist(lender1, true);
+        _depositAs(lender1, 1_000_000);
+        _fundAndApprove(lender1, 1_000_000);
+        vm.prank(lender1);
+        pool.mint(500_000, lender1);
+
+        _fundAndApprove(lender2, 3_000_000);
+        vm.startPrank(lender2);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        pool.deposit(1_000_000);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        pool.deposit(1_000_000, lender2);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        pool.mint(1_000_000, lender2);
+        vm.stopPrank();
+        assertEq(pool.balanceOf(lender2), 0);
+    }
+
+    function test_depositorWhitelist_gatesTheCallerNotTheReceiver() public {
+        _whitelist(lender1, true);
+        _fundAndApprove(lender1, 1_000_000);
+        vm.prank(lender1);
+        pool.deposit(1_000_000, lender2);
+        assertEq(pool.balanceOf(lender2), 1_000_000);
+    }
+
+    function test_depositorWhitelist_withdrawalsAlwaysWork() public {
+        _depositAs(lender2, 3_000_000); // before any whitelist
+        _whitelist(lender1, true);
+        _depositAs(lender1, 2_000_000);
+        _whitelist(lender1, false);
+        _whitelist(owner, true); // keep the whitelist active with neither lender on it
+
+        vm.startPrank(lender2);
+        pool.withdraw(1_000_000);
+        pool.withdrawAssets(1_000_000);
+        pool.redeem(500_000, lender2, lender2);
+        pool.withdraw(500_000, lender2, lender2);
+        vm.stopPrank();
+        assertEq(pool.balanceOf(lender2), 0);
+
+        vm.prank(lender1);
+        pool.withdrawAssets(2_000_000);
+        assertEq(usdc.balanceOf(lender1), 2_000_000);
+    }
+
+    function test_depositorWhitelist_removingLastReopens() public {
+        _whitelist(lender1, true);
+        _whitelist(lender1, true); // repeat add leaves the count alone
+        assertEq(pool.depositorWhitelistCount(), 1);
+        _whitelist(lender1, false);
+        _whitelist(lender1, false); // repeat remove does not underflow
+        assertEq(pool.depositorWhitelistCount(), 0);
+        _depositAs(lender2, 1_000_000);
+        assertEq(pool.balanceOf(lender2), 1_000_000);
+    }
+
+    function test_depositorWhitelist_batchSetter() public {
+        address[] memory list = new address[](2);
+        list[0] = lender1;
+        list[1] = lender2;
+        vm.prank(owner);
+        pool.setDepositorsWhitelisted(list, true);
+        assertEq(pool.depositorWhitelistCount(), 2);
+        assertTrue(pool.isDepositorWhitelisted(lender2));
+
+        vm.prank(owner);
+        pool.setDepositorsWhitelisted(list, false);
+        assertEq(pool.depositorWhitelistCount(), 0);
+    }
+
+    function test_depositorWhitelist_ownerOnlyAndNoZeroAddress() public {
+        vm.prank(lender1);
+        vm.expectRevert();
+        pool.setDepositorWhitelisted(lender1, true);
+
+        vm.prank(owner);
+        vm.expectRevert(ZeroAddress.selector);
+        pool.setDepositorWhitelisted(address(0), true);
+    }
+
+    function test_depositorWhitelist_maxDepositAndMintReflectIt() public {
+        assertEq(pool.maxDeposit(lender2), type(uint256).max);
+        _whitelist(lender1, true);
+        assertEq(pool.maxDeposit(lender1), type(uint256).max);
+        assertEq(pool.maxMint(lender1), type(uint256).max);
+        assertEq(pool.maxDeposit(lender2), 0);
+        assertEq(pool.maxMint(lender2), 0);
+    }
+
     // ── Borrow controls: caps ───────────────────────────────────────────
 
     function test_borrowCap_perLoan() public {
