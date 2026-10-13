@@ -66,7 +66,9 @@ contract AmplifiLendingPoolForkTest is Test {
         lender1 = makeAddr("lender1");
         lender2 = makeAddr("lender2");
 
-        pool = new AmplifiLendingPool(PUSD, owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        pool = new AmplifiLendingPool(
+            PUSD, owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
+        );
 
         deal(PUSD, lender1, 100_000 * 1e6);
         deal(PUSD, lender2, 100_000 * 1e6);

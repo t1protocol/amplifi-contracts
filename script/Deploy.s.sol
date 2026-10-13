@@ -24,6 +24,7 @@ contract Deploy is Script {
         uint256 kinkUtilizationBps = vm.envOr("KINK_UTILIZATION_BPS", DEFAULT_KINK_UTILIZATION_BPS);
         uint256 kinkRateBps = vm.envOr("KINK_RATE_BPS", DEFAULT_KINK_RATE_BPS);
         uint256 maxRateBps = vm.envOr("MAX_RATE_BPS", DEFAULT_MAX_RATE_BPS);
+        address[] memory depositors = vm.envOr("DEPOSITORS", ",", new address[](0));
 
         console2.log("=== AmplifiLendingPool deploy ===");
         console2.log("Underlying:        ", underlying);
@@ -33,10 +34,13 @@ contract Deploy is Script {
         console2.log("Kink util bps:     ", kinkUtilizationBps);
         console2.log("Kink rate bps:     ", kinkRateBps);
         console2.log("Max rate bps:      ", maxRateBps);
+        for (uint256 i; i < depositors.length; ++i) {
+            console2.log("Depositor:         ", depositors[i]);
+        }
 
         vm.startBroadcast();
         AmplifiLendingPool pool = new AmplifiLendingPool(
-            underlying, owner, teeOperator, baseRateBps, kinkUtilizationBps, kinkRateBps, maxRateBps
+            underlying, owner, teeOperator, baseRateBps, kinkUtilizationBps, kinkRateBps, maxRateBps, depositors
         );
         vm.stopBroadcast();
 

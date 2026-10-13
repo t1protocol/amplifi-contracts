@@ -10,6 +10,13 @@ Protocol contracts for Amplifi.
   that exposes a string `symbol()` and `decimals()`; one that does not reverts at
   deploy, and a rebasing or fee-on-transfer token does not fit the pool's
   balance-based accounting.
+  Deposits are open to anyone until a depositor is whitelisted, either at deploy (the
+  `DEPOSITORS` list, so the pool is never open in between) or later with
+  `setDepositorWhitelisted`. From then on `deposit` and `mint` need both the caller and
+  the share receiver on the list. Removing the last one opens deposits again, so add a
+  replacement before removing the old address. Withdrawals are never restricted. Meant
+  for the collateral-escrow margin pools, where the protocol is the only lender; the
+  amplifi pools leave it empty.
 - `src/RateAdminLendingPool.sol`: the pool with a delegated rate-admin role.
 - `src/CollateralEscrow.sol`: remote-chain collateral with EIP-712 release attestations.
 
@@ -29,8 +36,8 @@ After the deploy: `transferOwnership` to the final owner and have them `acceptOw
 chain's explorer. On Robinhood Chain that is the Blockscout at
 https://robinhoodchain.blockscout.com (the chain's explorer.mainnet host redirects
 there; robinscan.io is a separate front end with no verify API):
-`forge verify-contract --chain 4663 --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api --constructor-args $(cast abi-encode "constructor(address,address,address,uint256,uint256,uint256,uint256)" <asset> <owner> <operator> <base> <kinkUtil> <kinkRate> <max>) <address> src/AmplifiLendingPool.sol:AmplifiLendingPool`,
-with the seven constructor values the deploy printed.
+`forge verify-contract --chain 4663 --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api --constructor-args $(cast abi-encode "constructor(address,address,address,uint256,uint256,uint256,uint256,address[])" <asset> <owner> <operator> <base> <kinkUtil> <kinkRate> <max> "[<depositors>]") <address> src/AmplifiLendingPool.sol:AmplifiLendingPool`,
+with the constructor values the deploy printed (`"[]"` for an open pool).
 
 ## Test
 

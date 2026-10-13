@@ -84,6 +84,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     bool public borrowAllowlistEnabled;
     mapping(address wallet => bool allowed) public allowedBorrowerWallet;
 
+    // Optional depositor whitelist. While nobody is on it (count 0) anyone can deposit;
+    // once an address is added, deposit and mint need both the caller and the share
+    // receiver whitelisted. Withdrawals are never restricted. Seed it at deploy so the
+    // pool is never open in between.
+    mapping(address depositor => bool whitelisted) public isDepositorWhitelisted;
+    uint256 public depositorWhitelistCount;
+
     // Borrow circuit breakers (0 = disabled). `maxBorrowPerLoan` caps a single borrow;
     // `maxBorrowPerWindow` caps cumulative borrows inside a rolling `borrowWindow`
     // (tumbling), bounding how much a compromised operator can drain in one burst before
@@ -122,6 +129,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event PoolStatusUpdated(PoolStatus oldStatus, PoolStatus newStatus);
     event BorrowAllowlistEnabledUpdated(bool enabled);
     event AllowedBorrowerWalletUpdated(address indexed wallet, bool allowed);
+    event DepositorWhitelistUpdated(address indexed depositor, bool whitelisted);
     event BorrowCapsUpdated(uint256 maxBorrowPerLoan, uint256 maxBorrowPerWindow, uint256 borrowWindow);
     event ProtocolFeeUpdated(uint256 feeBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
@@ -140,6 +148,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error LoanAlreadyExists();
     error LoanNotFound();
     error WalletNotAllowed();
+    error DepositorNotWhitelisted();
     error BorrowCapExceeded();
     error InvalidBorrowCaps();
     error InvalidFeeParams();
@@ -165,7 +174,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 _baseRateBps,
         uint256 _kinkUtilizationBps,
         uint256 _kinkRateBps,
-        uint256 _maxRateBps
+        uint256 _maxRateBps,
+        address[] memory _depositors
     ) ERC20(shareName(_usdc), shareSymbol(_usdc)) Ownable(_owner) {
         // A zero asset already reverted in shareName, before this body ran.
         if (_teeOperator == address(0)) revert ZeroAddress();
@@ -179,6 +189,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         lastAccrualTimestamp = block.timestamp;
 
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
+
+        uint256 len = _depositors.length;
+        for (uint256 i; i < len; ++i) {
+            _setDepositorWhitelisted(_depositors[i], true);
+        }
     }
 
     // ── ERC20 / IERC20Metadata Override ─────────────────────────────────
@@ -202,6 +217,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     function deposit(uint256 assets, address receiver) public nonReentrant whenActive returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+        _checkDepositor(msg.sender, receiver);
         accrueInterest();
 
         shares = assetsToShares(assets);
@@ -216,6 +232,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     function mint(uint256 shares, address receiver) external nonReentrant whenActive returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
+        _checkDepositor(msg.sender, receiver);
         accrueInterest();
 
         assets = previewMint(shares);
@@ -460,12 +477,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── ERC-4626 View Functions ──────────────────────────────────────────
 
-    function maxDeposit(address) external view returns (uint256) {
-        return status == PoolStatus.Active ? type(uint256).max : 0;
+    function maxDeposit(address receiver) external view returns (uint256) {
+        return status == PoolStatus.Active && _canDeposit(receiver) ? type(uint256).max : 0;
     }
 
-    function maxMint(address) external view returns (uint256) {
-        return status == PoolStatus.Active ? type(uint256).max : 0;
+    function maxMint(address receiver) external view returns (uint256) {
+        return status == PoolStatus.Active && _canDeposit(receiver) ? type(uint256).max : 0;
     }
 
     function maxWithdraw(address _owner) external view returns (uint256) {
@@ -569,6 +586,19 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         }
     }
 
+    /// @notice Add or remove a depositor. Removing the last one reopens deposits to anyone.
+    function setDepositorWhitelisted(address depositor, bool whitelisted) external onlyOwner {
+        _setDepositorWhitelisted(depositor, whitelisted);
+    }
+
+    /// @notice Batch variant of setDepositorWhitelisted.
+    function setDepositorsWhitelisted(address[] calldata depositors, bool whitelisted) external onlyOwner {
+        uint256 len = depositors.length;
+        for (uint256 i; i < len; ++i) {
+            _setDepositorWhitelisted(depositors[i], whitelisted);
+        }
+    }
+
     /// @notice Set the borrow circuit breakers. `_maxBorrowPerLoan` caps a single borrow;
     ///         `_maxBorrowPerWindow` caps cumulative borrows inside a rolling `_borrowWindow`
     ///         (seconds). Any of the caps set to 0 disables that check. Resets the running
@@ -612,6 +642,26 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     // ── Internal ────────────────────────────────────────────────────────
+
+    function _setDepositorWhitelisted(address depositor, bool whitelisted) internal {
+        if (depositor == address(0)) revert ZeroAddress();
+        if (isDepositorWhitelisted[depositor] != whitelisted) {
+            isDepositorWhitelisted[depositor] = whitelisted;
+            if (whitelisted) ++depositorWhitelistCount;
+            else --depositorWhitelistCount;
+        }
+        emit DepositorWhitelistUpdated(depositor, whitelisted);
+    }
+
+    function _canDeposit(address account) internal view returns (bool) {
+        return depositorWhitelistCount == 0 || isDepositorWhitelisted[account];
+    }
+
+    /// @dev Both the funder and the share receiver must be whitelisted, so no outside
+    ///      address gains shares through a deposit.
+    function _checkDepositor(address caller, address receiver) internal view {
+        if (!_canDeposit(caller) || !_canDeposit(receiver)) revert DepositorNotWhitelisted();
+    }
 
     /// @dev Enforce the OWNER-configured borrow controls (allowlist + per-loan cap + rolling
     ///      window cap). All checks are no-ops until an owner sets them. On the window cap this
