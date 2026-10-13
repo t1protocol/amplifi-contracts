@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, console2} from "forge-std/Test.sol";
 import {AmplifiLendingPool, PoolStatus, ZeroAddress} from "../src/AmplifiLendingPool.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USD Coin", "USDC") {}
@@ -50,7 +51,9 @@ contract AmplifiLendingPoolTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        pool = new AmplifiLendingPool(address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        pool = new AmplifiLendingPool(
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -683,8 +686,9 @@ contract AmplifiLendingPoolTest is Test {
 
     function test_shareToken_followsAnUnderlyingWith18Decimals() public {
         MockToken weth = new MockToken("WETH", 18);
-        AmplifiLendingPool p =
-            new AmplifiLendingPool(address(weth), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        AmplifiLendingPool p = new AmplifiLendingPool(
+            address(weth), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
+        );
         assertEq(p.name(), "Amplifi WETH Lending Share");
         assertEq(p.symbol(), "aWETH");
         assertEq(p.decimals(), 18);
@@ -723,7 +727,9 @@ contract AmplifiLendingPoolTest is Test {
 
     function test_constructorRejectsZeroAsset() public {
         vm.expectRevert(ZeroAddress.selector);
-        new AmplifiLendingPool(address(0), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        new AmplifiLendingPool(
+            address(0), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
+        );
     }
 
     // ── ERC-4626 View Functions ─────────────────────────────────────────
@@ -1357,12 +1363,54 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.balanceOf(lender2), 0);
     }
 
-    function test_depositorWhitelist_gatesTheCallerNotTheReceiver() public {
+    function test_depositorWhitelist_receiverMustBeListedToo() public {
         _whitelist(lender1, true);
-        _fundAndApprove(lender1, 1_000_000);
+        _fundAndApprove(lender1, 2_000_000);
+        vm.startPrank(lender1);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        pool.deposit(1_000_000, lender2);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        pool.mint(1_000_000, lender2);
+        vm.stopPrank();
+
+        _whitelist(lender2, true);
         vm.prank(lender1);
         pool.deposit(1_000_000, lender2);
         assertEq(pool.balanceOf(lender2), 1_000_000);
+    }
+
+    function test_depositorWhitelist_seededAtDeploy() public {
+        address[] memory seed = new address[](1);
+        seed[0] = lender1;
+        AmplifiLendingPool seeded =
+            new AmplifiLendingPool(address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, seed);
+        assertEq(seeded.depositorWhitelistCount(), 1);
+        assertTrue(seeded.isDepositorWhitelisted(lender1));
+
+        usdc.mint(lender2, 1_000_000);
+        vm.startPrank(lender2);
+        usdc.approve(address(seeded), 1_000_000);
+        vm.expectRevert(AmplifiLendingPool.DepositorNotWhitelisted.selector);
+        seeded.deposit(1_000_000);
+        vm.stopPrank();
+    }
+
+    function test_depositorWhitelist_seedRejectsZeroAddress() public {
+        address[] memory seed = new address[](1);
+        vm.expectRevert(ZeroAddress.selector);
+        new AmplifiLendingPool(address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, seed);
+    }
+
+    function test_depositorWhitelist_emitsOnEveryCall() public {
+        vm.startPrank(owner);
+        vm.expectEmit(address(pool));
+        emit AmplifiLendingPool.DepositorWhitelistUpdated(lender1, true);
+        pool.setDepositorWhitelisted(lender1, true);
+        vm.expectEmit(address(pool));
+        emit AmplifiLendingPool.DepositorWhitelistUpdated(lender1, true);
+        pool.setDepositorWhitelisted(lender1, true);
+        vm.stopPrank();
+        assertEq(pool.depositorWhitelistCount(), 1);
     }
 
     function test_depositorWhitelist_withdrawalsAlwaysWork() public {
@@ -1412,7 +1460,7 @@ contract AmplifiLendingPoolTest is Test {
 
     function test_depositorWhitelist_ownerOnlyAndNoZeroAddress() public {
         vm.prank(lender1);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, lender1));
         pool.setDepositorWhitelisted(lender1, true);
 
         vm.prank(owner);

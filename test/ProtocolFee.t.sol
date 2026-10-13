@@ -31,7 +31,9 @@ contract ProtocolFeeTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        pool = new AmplifiLendingPool(address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        pool = new AmplifiLendingPool(
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
+        );
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

@@ -10,11 +10,13 @@ Protocol contracts for Amplifi.
   that exposes a string `symbol()` and `decimals()`; one that does not reverts at
   deploy, and a rebasing or fee-on-transfer token does not fit the pool's
   balance-based accounting.
-  Deposits are open to anyone until the owner whitelists a depositor with
-  `setDepositorWhitelisted`; from then on only whitelisted callers can `deposit` or
-  `mint`, and removing the last one opens deposits again. Withdrawals are never
-  restricted. Used on the collateral-escrow margin pools, where the protocol is the only
-  lender; the amplifi pools leave it empty.
+  Deposits are open to anyone until a depositor is whitelisted, either at deploy (the
+  `DEPOSITORS` list, so the pool is never open in between) or later with
+  `setDepositorWhitelisted`. From then on `deposit` and `mint` need both the caller and
+  the share receiver on the list. Removing the last one opens deposits again, so add a
+  replacement before removing the old address. Withdrawals are never restricted. Meant
+  for the collateral-escrow margin pools, where the protocol is the only lender; the
+  amplifi pools leave it empty.
 - `src/RateAdminLendingPool.sol`: the pool with a delegated rate-admin role.
 - `src/CollateralEscrow.sol`: remote-chain collateral with EIP-712 release attestations.
 

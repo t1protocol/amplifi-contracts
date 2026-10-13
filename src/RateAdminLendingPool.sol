@@ -22,7 +22,11 @@ contract RateAdminLendingPool is AmplifiLendingPool {
         address _rateAdmin,
         uint256 _feeBps,
         address _feeRecipient
-    ) AmplifiLendingPool(_usdc, _owner, _teeOperator, _baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps) {
+    )
+        AmplifiLendingPool(
+            _usdc, _owner, _teeOperator, _baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps, new address[](0)
+        )
+    {
         rateAdmin = _rateAdmin;
         _setProtocolFee(_feeBps);
         feeRecipient = _feeRecipient;
