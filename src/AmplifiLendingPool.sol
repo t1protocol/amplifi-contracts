@@ -215,9 +215,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function deposit(uint256 assets, address receiver) public nonReentrant whenActive returns (uint256 shares) {
-        _checkDepositor(msg.sender, receiver);
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+        _checkDepositor(msg.sender, receiver);
         accrueInterest();
 
         shares = assetsToShares(assets);
@@ -230,9 +230,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function mint(uint256 shares, address receiver) external nonReentrant whenActive returns (uint256 assets) {
-        _checkDepositor(msg.sender, receiver);
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
+        _checkDepositor(msg.sender, receiver);
         accrueInterest();
 
         assets = previewMint(shares);

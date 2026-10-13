@@ -36,8 +36,8 @@ After the deploy: `transferOwnership` to the final owner and have them `acceptOw
 chain's explorer. On Robinhood Chain that is the Blockscout at
 https://robinhoodchain.blockscout.com (the chain's explorer.mainnet host redirects
 there; robinscan.io is a separate front end with no verify API):
-`forge verify-contract --chain 4663 --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api --constructor-args $(cast abi-encode "constructor(address,address,address,uint256,uint256,uint256,uint256)" <asset> <owner> <operator> <base> <kinkUtil> <kinkRate> <max>) <address> src/AmplifiLendingPool.sol:AmplifiLendingPool`,
-with the seven constructor values the deploy printed.
+`forge verify-contract --chain 4663 --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api --constructor-args $(cast abi-encode "constructor(address,address,address,uint256,uint256,uint256,uint256,address[])" <asset> <owner> <operator> <base> <kinkUtil> <kinkRate> <max> "[<depositors>]") <address> src/AmplifiLendingPool.sol:AmplifiLendingPool`,
+with the constructor values the deploy printed (`"[]"` for an open pool).
 
 ## Test
 
