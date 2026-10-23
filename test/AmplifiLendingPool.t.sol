@@ -54,6 +54,8 @@ contract AmplifiLendingPoolTest is Test {
         pool = new AmplifiLendingPool(
             address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
         );
+        vm.prank(owner);
+        pool.setBorrowPaused(false);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -83,18 +85,52 @@ contract AmplifiLendingPoolTest is Test {
         uint256 bal = usdc.balanceOf(wallet);
         if (bal < debt) usdc.mint(wallet, debt - bal);
         vm.startPrank(wallet);
+        pool.beginRepay(loanId);
         usdc.transfer(address(pool), debt);
         pool.repay(loanId, debt);
         vm.stopPrank();
     }
 
-    /// @dev Push-based repay of an explicit `amount` (may be < debt → bad debt) from the
-    ///      loan's wallet. Wallet must already hold `amount`.
+    /// @dev Wallet must already hold the requested payment; residual debt stays open.
     function _repayAmount(uint256 loanId, uint256 amount) internal {
         address wallet = pool.loanWallet(loanId);
         vm.startPrank(wallet);
+        pool.beginRepay(loanId);
         usdc.transfer(address(pool), amount);
         pool.repay(loanId, amount);
+        vm.stopPrank();
+    }
+
+    function _settleAmount(uint256 loanId, uint256 amount) internal {
+        uint256 key = 0x123456;
+        vm.prank(owner);
+        pool.setSettlementSigner(vm.addr(key));
+        address wallet = pool.loanWallet(loanId);
+        uint256 maxWriteOff = pool.loanDebt(loanId);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("AmplifiLendingPool"),
+                keccak256("2"),
+                block.chainid,
+                address(pool)
+            )
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                domain,
+                keccak256(
+                    abi.encode(pool.LOSS_SETTLEMENT_TYPEHASH(), loanId, wallet, amount, maxWriteOff, loanId, deadline)
+                )
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 ss) = vm.sign(key, digest);
+        vm.startPrank(wallet);
+        pool.beginRepay(loanId);
+        if (amount != 0) usdc.transfer(address(pool), amount);
+        pool.settleLoss(loanId, amount, maxWriteOff, loanId, deadline, abi.encodePacked(r, ss, v));
         vm.stopPrank();
     }
 
@@ -289,6 +325,7 @@ contract AmplifiLendingPoolTest is Test {
         // Loan 1 is repaid BY walletA pushing its own funds; walletB (loan 2) is untouched.
         // Event must attribute the repayment to walletA (repaid == debt == 40M, shares == 40M).
         vm.startPrank(walletA);
+        pool.beginRepay(1);
         usdc.transfer(address(pool), 40_000_000);
         vm.expectEmit(true, true, false, true, address(pool));
         emit AmplifiLendingPool.Repay(1, walletA, 40_000_000, 40_000_000);
@@ -702,6 +739,8 @@ contract AmplifiLendingPoolTest is Test {
         vm.stopPrank();
         assertEq(shares, 100 ether);
 
+        vm.prank(owner);
+        p.setBorrowPaused(false);
         vm.prank(teeOperator);
         p.borrow(1, 40 ether, borrower);
         assertEq(weth.balanceOf(borrower), 40 ether);
@@ -714,6 +753,7 @@ contract AmplifiLendingPoolTest is Test {
         assertLt(debt, 45 ether);
         weth.mint(borrower, debt - 40 ether);
         vm.startPrank(borrower);
+        p.beginRepay(1);
         weth.transfer(address(p), debt);
         p.repay(1, debt);
         vm.stopPrank();
@@ -930,10 +970,7 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.loanShares(1), 0);
     }
 
-    function test_repay_pushOverDebt_excessStaysInPool() public {
-        // Push model: repay credits min(amount, debt). If the wallet pushes MORE than
-        // the debt, only the debt is credited (no bad debt) and the excess stays as pool
-        // liquidity — it is NOT refunded. Callers therefore push exactly what they intend.
+    function test_repay_pushOverDebt_refundsExcess() public {
         _depositAs(lender1, 100_000_000);
         _borrow(1, 50_000_000); // no interest yet: debt == 50M, borrower holds 50M
         usdc.mint(borrower, 10_000_000); // borrower now holds 60M
@@ -943,11 +980,7 @@ contract AmplifiLendingPoolTest is Test {
 
         assertEq(pool.loanShares(1), 0, "loan fully closed");
         assertEq(pool.totalBadDebtRealized(), 0, "full repay books no bad debt");
-        assertEq(
-            pool.availableLiquidity(),
-            idleBefore + 60_000_000,
-            "all pushed pUSD is pool liquidity (excess not refunded)"
-        );
+        assertEq(pool.availableLiquidity(), idleBefore + 50_000_000, "only credited funds remain in the pool");
     }
 
     function test_repay_fullRepay_noBadDebt() public {
@@ -964,42 +997,18 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.totalBadDebtRealized(), 0, "full repay books no bad debt");
     }
 
-    function test_repay_partialRepay_writesOffShortfall() public {
-        // Simulates the interest-drift-exceeds-user-equity scenario:
-        // fundAccount has less than full debt, shortfall is bad debt.
+    function test_repay_partialRepay_keepsResidualDebt() public {
         _depositAs(lender1, 100_000_000);
         _borrow(1, 50_000_000);
-
         vm.warp(block.timestamp + 365 days);
-
         uint256 debt = pool.loanDebt(1);
-        assertGt(debt, 50_000_000, "Debt should include interest");
-
-        // fundAccount only has the original principal (50M), not the interest
-        uint256 fundBalance = usdc.balanceOf(borrower);
-        assertEq(fundBalance, 50_000_000, "Fund account has only principal");
-        assertGt(debt, fundBalance, "Debt exceeds fund balance");
-
-        // Record lender share value before bad debt
-        uint256 shareValueBefore = pool.sharesToAssets(pool.balanceOf(lender1));
-
-        _repayAmount(1, fundBalance); // wallet pushes only principal, not interest
-
-        // Loan is fully closed
-        assertEq(pool.totalBorrowShares(), 0);
-        assertEq(pool.loanShares(1), 0);
-
-        // Pool received only fundBalance, not full debt
-        // The difference (debt - fundBalance) is bad debt absorbed by lenders
-        uint256 shareValueAfter = pool.sharesToAssets(pool.balanceOf(lender1));
-        assertLt(shareValueAfter, shareValueBefore, "Share value decreased due to bad debt");
-
-        // The bad debt amount = interest that wasn't paid
-        uint256 expectedBadDebt = debt - fundBalance;
-        uint256 shareLoss = shareValueBefore - shareValueAfter;
-        // Loss should be approximately equal to bad debt (virtual offset causes small deviation)
-        assertGe(shareLoss, (expectedBadDebt * 99) / 100, "Loss should be ~bad debt");
-        assertLe(shareLoss, expectedBadDebt + 1000, "Loss shouldn't exceed bad debt significantly");
+        uint256 assets = pool.totalAssets();
+        _repayAmount(1, 50_000_000);
+        uint256 credited = 50_000_000 - usdc.balanceOf(borrower);
+        assertApproxEqAbs(pool.loanDebt(1), debt - credited, 1);
+        assertEq(pool.totalBadDebtRealized(), 0);
+        assertApproxEqAbs(pool.totalAssets(), assets, 1);
+        assertGt(pool.loanPrincipal(1), 0);
     }
 
     function test_repay_zeroMaxRepay_fullWriteOff() public {
@@ -1011,10 +1020,8 @@ contract AmplifiLendingPoolTest is Test {
 
         uint256 shareValueBefore = pool.sharesToAssets(pool.balanceOf(lender1));
 
-        // The loan's own wallet writes it off entirely by pushing nothing and repaying 0
-        // (total-loss liquidation). Only the wallet can do this — see the gate test.
-        vm.prank(borrower);
-        pool.repay(1, 0); // zero repayment
+        // A separate settlement signer authorizes the terminal zero-recovery loss.
+        _settleAmount(1, 0);
 
         assertEq(pool.totalBorrowShares(), 0);
 
@@ -1039,7 +1046,7 @@ contract AmplifiLendingPoolTest is Test {
         uint256 lender2ValueBefore = pool.sharesToAssets(pool.balanceOf(lender2));
 
         // Wallet can only push 60M (principal), not the accrued interest
-        _repayAmount(1, fundBalance);
+        _settleAmount(1, fundBalance);
 
         uint256 lender1ValueAfter = pool.sharesToAssets(pool.balanceOf(lender1));
         uint256 lender2ValueAfter = pool.sharesToAssets(pool.balanceOf(lender2));
@@ -1546,14 +1553,13 @@ contract AmplifiLendingPoolTest is Test {
 
         // Loan 1: wallet pushes only part of the debt → shortfall booked as bad debt.
         _borrow(1, 100_000_000, borrower);
-        _repayAmount(1, 40_000_000); // debt ~100, push 40 → ~60 bad debt
+        _settleAmount(1, 40_000_000);
         uint256 afterFirst = pool.totalBadDebtRealized();
         assertGt(afterFirst, 0, "partial repay books bad debt");
 
         // Loan 2: total write-off — the wallet repays 0 (pushes nothing).
         _borrow(2, 30_000_000, borrower);
-        vm.prank(borrower);
-        pool.repay(2, 0);
+        _settleAmount(2, 0);
         assertEq(pool.totalBadDebtRealized(), afterFirst + 30_000_000, "repay(0) adds full debt to counter");
     }
 

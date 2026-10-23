@@ -11,7 +11,7 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @title CollateralEscrow
 /// @notice Holds user collateral released only against EIP-712 withdrawal attestations signed by
-///         amplifi-controlled attester keys, with a separate seizer role for the shortfall path.
+///         amplifi-controlled attester keys. Seizures are deliberately unsupported.
 ///         Spec: amplifi docs/collateral-escrow-attestation.md. Per-account balances are
 ///         informational accounting (clamped at zero, never a release ceiling): the contract may
 ///         hold a protocol-funded cushion (see fundCushion) so releases can exceed a user's own
@@ -28,58 +28,36 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
         uint256 deadline;
     }
 
-    struct CollateralSeizure {
-        address account;
-        address token;
-        uint256 amount;
-        address recipient;
-        uint256 attestationId;
-        uint256 deadline;
+    struct TokenCaps {
+        uint256 perAttestationCap;
+        uint256 dailyReleaseLimit;
+        uint256 dayStart;
+        uint256 releasedInDay;
     }
 
     // ── Constants ───────────────────────────────────────────────────────
     bytes32 public constant COLLATERAL_RELEASE_TYPEHASH = keccak256(
         "CollateralRelease(address account,address token,uint256 amount,uint256 attestationId,uint256 deadline)"
     );
-    bytes32 public constant COLLATERAL_SEIZURE_TYPEHASH = keccak256(
-        "CollateralSeizure(address account,address token,uint256 amount,address recipient,uint256 attestationId,uint256 deadline)"
-    );
-
     // ── State ───────────────────────────────────────────────────────────
     mapping(address account => mapping(address token => uint256)) public balances;
-    // Shared across release and seizure so amplifi allocates ids from one sequence.
     mapping(uint256 attestationId => bool) public consumed;
     mapping(address => bool) public isAttester;
-    mapping(address => bool) public isSeizer;
     mapping(address token => bool) public isCollateralAllowed;
-    mapping(address recipient => bool) public isSeizureRecipient;
 
-    uint256 public maxAttestationTtl = 30 days;
-    uint256 public perAttestationCap; // 0 = disabled
-    uint256 public dailyReleaseLimit; // 0 = disabled
-    uint256 public dayStart;
-    uint256 public releasedInDay;
+    uint256 public maxAttestationTtl;
+    mapping(address token => TokenCaps) public tokenCaps;
 
     // ── Events ──────────────────────────────────────────────────────────
     event CollateralDeposited(address indexed account, address indexed token, uint256 amount);
     event CollateralReleased(
         address indexed account, address indexed token, uint256 amount, uint256 indexed attestationId, address caller
     );
-    event CollateralSeized(
-        address indexed account,
-        address indexed token,
-        uint256 amount,
-        address recipient,
-        uint256 indexed attestationId,
-        address caller
-    );
     event CushionFunded(address indexed funder, address indexed token, uint256 amount);
     event AttestationCancelled(uint256 indexed attestationId, address indexed attester);
     event AttesterUpdated(address indexed attester, bool allowed);
-    event SeizerUpdated(address indexed seizer, bool allowed);
     event CollateralAllowedUpdated(address indexed token, bool allowed);
-    event SeizureRecipientUpdated(address indexed recipient, bool allowed);
-    event CapsUpdated(uint256 perAttestationCap, uint256 dailyReleaseLimit);
+    event CapsUpdated(address indexed token, uint256 perAttestationCap, uint256 dailyReleaseLimit);
     event MaxAttestationTtlUpdated(uint256 maxAttestationTtl);
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -90,14 +68,32 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
     error DeadlineTooFar();
     error InvalidAttester();
     error AttestationConsumed();
-    error OnlySeizer();
     error OnlyAttester();
-    error RecipientNotAllowed();
     error PerAttestationCapExceeded();
     error DailyReleaseLimitExceeded();
     error ZeroTtl();
+    error InvalidCaps();
+    error OwnerIsAttester();
 
-    constructor(address initialOwner) EIP712("Amplifi", "1") Ownable(initialOwner) {}
+    constructor(
+        address initialOwner,
+        address collateralToken,
+        address attester,
+        uint256 perAttestation,
+        uint256 dailyLimit,
+        uint256 ttl
+    ) EIP712("Amplifi", "1") Ownable(initialOwner) {
+        if (collateralToken == address(0) || attester == address(0)) revert ZeroAddress();
+        if (initialOwner == attester) revert OwnerIsAttester();
+        if (ttl == 0) revert ZeroTtl();
+        _setTokenCaps(collateralToken, perAttestation, dailyLimit);
+        isCollateralAllowed[collateralToken] = true;
+        isAttester[attester] = true;
+        maxAttestationTtl = ttl;
+        emit CollateralAllowedUpdated(collateralToken, true);
+        emit AttesterUpdated(attester, true);
+        emit MaxAttestationTtlUpdated(ttl);
+    }
 
     // ── Deposits ────────────────────────────────────────────────────────
 
@@ -133,7 +129,9 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
         if (release.amount == 0) revert ZeroAmount();
         if (block.timestamp > release.deadline) revert AttestationExpired();
         if (release.deadline > block.timestamp + maxAttestationTtl) revert DeadlineTooFar();
-        if (perAttestationCap != 0 && release.amount > perAttestationCap) revert PerAttestationCapExceeded();
+        TokenCaps storage caps = tokenCaps[release.token];
+        if (caps.perAttestationCap == 0) revert TokenNotAllowed();
+        if (release.amount > caps.perAttestationCap) revert PerAttestationCapExceeded();
 
         bytes32 structHash = keccak256(
             abi.encode(
@@ -151,14 +149,12 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
         if (consumed[release.attestationId]) revert AttestationConsumed();
         consumed[release.attestationId] = true;
 
-        if (dailyReleaseLimit != 0) {
-            if (block.timestamp >= dayStart + 1 days) {
-                dayStart = block.timestamp;
-                releasedInDay = 0;
-            }
-            if (releasedInDay + release.amount > dailyReleaseLimit) revert DailyReleaseLimitExceeded();
-            releasedInDay += release.amount;
+        if (block.timestamp >= caps.dayStart + 1 days) {
+            caps.dayStart = block.timestamp;
+            caps.releasedInDay = 0;
         }
+        if (caps.releasedInDay + release.amount > caps.dailyReleaseLimit) revert DailyReleaseLimitExceeded();
+        caps.releasedInDay += release.amount;
 
         uint256 bal = balances[release.account][release.token];
         balances[release.account][release.token] = bal > release.amount ? bal - release.amount : 0;
@@ -167,8 +163,7 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
         emit CollateralReleased(release.account, release.token, release.amount, release.attestationId, msg.sender);
     }
 
-    /// @notice Mark an attestation id consumed without transferring, so a corrected attestation
-    ///         can be re-issued immediately (e.g. after a seizure strands a live one).
+    /// @notice Cancel a pending release so the attester can issue a corrected one.
     function cancelAttestation(uint256 attestationId) external {
         if (!isAttester[msg.sender]) revert OnlyAttester();
         if (consumed[attestationId]) revert AttestationConsumed();
@@ -176,57 +171,38 @@ contract CollateralEscrow is EIP712, Pausable, Ownable2Step {
         emit AttestationCancelled(attestationId, msg.sender);
     }
 
-    // ── Seizure (shortfall path) ────────────────────────────────────────
-
-    /// @notice Move collateral to an allowlisted protocol recipient on a shortfall. Gated on a
-    ///         seizer set kept separate from the attester set, so one leaked key never grants
-    ///         both release and seizure authority. Shares the consumed-id mapping with release.
-    function seize(CollateralSeizure calldata s) external whenNotPaused {
-        if (!isSeizer[msg.sender]) revert OnlySeizer();
-        if (s.amount == 0) revert ZeroAmount();
-        if (!isSeizureRecipient[s.recipient]) revert RecipientNotAllowed();
-
-        if (consumed[s.attestationId]) revert AttestationConsumed();
-        consumed[s.attestationId] = true;
-
-        uint256 bal = balances[s.account][s.token];
-        balances[s.account][s.token] = bal > s.amount ? bal - s.amount : 0;
-
-        IERC20(s.token).safeTransfer(s.recipient, s.amount);
-        emit CollateralSeized(s.account, s.token, s.amount, s.recipient, s.attestationId, msg.sender);
-    }
-
     // ── Owner admin ─────────────────────────────────────────────────────
+
+    function acceptOwnership() public override {
+        if (isAttester[msg.sender]) revert OwnerIsAttester();
+        super.acceptOwnership();
+    }
 
     function setAttester(address attester, bool allowed) external onlyOwner {
         if (attester == address(0)) revert ZeroAddress();
+        if (allowed && attester == owner()) revert OwnerIsAttester();
         isAttester[attester] = allowed;
         emit AttesterUpdated(attester, allowed);
     }
 
-    function setSeizer(address seizer, bool allowed) external onlyOwner {
-        if (seizer == address(0)) revert ZeroAddress();
-        isSeizer[seizer] = allowed;
-        emit SeizerUpdated(seizer, allowed);
-    }
-
     function setCollateralAllowed(address token, bool allowed) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
+        if (allowed && tokenCaps[token].perAttestationCap == 0) revert InvalidCaps();
         isCollateralAllowed[token] = allowed;
         emit CollateralAllowedUpdated(token, allowed);
     }
 
-    function setSeizureRecipient(address recipient, bool allowed) external onlyOwner {
-        if (recipient == address(0)) revert ZeroAddress();
-        isSeizureRecipient[recipient] = allowed;
-        emit SeizureRecipientUpdated(recipient, allowed);
+    function setTokenCaps(address token, uint256 perAttestation, uint256 dailyLimit) external onlyOwner {
+        _setTokenCaps(token, perAttestation, dailyLimit);
     }
 
-    /// @notice 0 disables the corresponding cap.
-    function setCaps(uint256 perAttestation, uint256 dailyLimit) external onlyOwner {
-        perAttestationCap = perAttestation;
-        dailyReleaseLimit = dailyLimit;
-        emit CapsUpdated(perAttestation, dailyLimit);
+    function _setTokenCaps(address token, uint256 perAttestation, uint256 dailyLimit) internal {
+        if (token == address(0)) revert ZeroAddress();
+        if (perAttestation == 0 || dailyLimit < perAttestation) revert InvalidCaps();
+        TokenCaps storage caps = tokenCaps[token];
+        caps.perAttestationCap = perAttestation;
+        caps.dailyReleaseLimit = dailyLimit;
+        emit CapsUpdated(token, perAttestation, dailyLimit);
     }
 
     function setMaxAttestationTtl(uint256 ttl) external onlyOwner {

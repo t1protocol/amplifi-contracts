@@ -34,6 +34,8 @@ contract ProtocolFeeTest is Test {
         pool = new AmplifiLendingPool(
             address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
         );
+        vm.prank(owner);
+        pool.setBorrowPaused(false);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ contract ProtocolFeeTest is Test {
         uint256 bal = usdc.balanceOf(borrower);
         if (bal < debt) usdc.mint(borrower, debt - bal);
         vm.startPrank(borrower);
+        pool.beginRepay(loanId);
         usdc.transfer(address(pool), debt);
         pool.repay(loanId, debt);
         vm.stopPrank();
@@ -158,6 +161,7 @@ contract ProtocolFeeTest is Test {
 
         usdc.mint(borrower, debt);
         vm.startPrank(borrower);
+        pool.beginRepay(1);
         usdc.transfer(address(pool), debt);
         vm.expectEmit(true, false, false, true, address(pool));
         emit ProtocolFeeAccrued(1, interest, fee);
@@ -167,24 +171,22 @@ contract ProtocolFeeTest is Test {
 
     // ── No fee on bad debt / zero interest ─────────────────────────────────────
 
-    function test_noFee_onBadDebt() public {
+    function test_partialPayment_chargesOnlyPaidInterest() public {
         _setFee(FEE_BPS);
         _deposit(1_000e6);
         _borrow(1, 500e6);
         vm.warp(block.timestamp + 365 days);
-
         pool.accrueInterest();
-        uint256 debt = pool.loanDebt(1);
-        uint256 short = debt - 1; // 1 wei short => bad debt
-
-        usdc.mint(borrower, short);
+        uint256 interest = pool.loanDebt(1) - 500e6;
+        uint256 paid = interest / 2;
         vm.startPrank(borrower);
-        usdc.transfer(address(pool), short);
-        pool.repay(1, short);
+        pool.beginRepay(1);
+        usdc.transfer(address(pool), paid);
+        pool.repay(1, paid);
         vm.stopPrank();
-
-        assertEq(pool.protocolFeesAccrued(), 0);
-        assertEq(pool.totalBadDebtRealized(), 1);
+        assertEq(pool.protocolFeesAccrued(), paid * FEE_BPS / 10_000);
+        assertEq(pool.totalBadDebtRealized(), 0);
+        assertEq(pool.loanPrincipal(1), 500e6);
     }
 
     function test_noFee_onZeroInterest() public {
@@ -284,5 +286,22 @@ contract ProtocolFeeTest is Test {
         pool.collectProtocolFees(treasury, fee / 2);
         assertEq(usdc.balanceOf(treasury), fee / 2);
         assertEq(pool.protocolFeesAccrued(), fee - fee / 2);
+    }
+
+    function test_collect_preservesAlreadyAccruedDebt() public {
+        uint256 fee = _accrueSomeFee();
+        _borrow(2, 900e6);
+        vm.warp(block.timestamp + 30 days);
+        uint256 debt = pool.loanDebt(2);
+        uint256 borrowed = pool.totalBorrowed();
+        uint256 assets = pool.totalAssets();
+
+        vm.prank(owner);
+        pool.collectProtocolFees(treasury, fee);
+
+        assertEq(pool.loanDebt(2), debt);
+        assertEq(pool.totalBorrowAssets(), borrowed);
+        assertEq(pool.totalAssets(), assets);
+        assertEq(usdc.balanceOf(treasury), fee);
     }
 }

@@ -24,6 +24,7 @@ contract DeployRateAdmin is Script {
         address underlying = vm.envOr("UNDERLYING_ADDRESS", DEFAULT_UNDERLYING);
         address owner = vm.envAddress("OWNER_ADDRESS");
         address teeOperator = vm.envOr("TEE_OPERATOR_ADDRESS", DEFAULT_TEE_OPERATOR);
+        require(owner != teeOperator, "Owner and operator must be separate");
         // Optional: address(0) deploys with the role unset; assign later via setRateAdmin().
         address rateAdmin = vm.envOr("RATE_ADMIN_ADDRESS", address(0));
 
@@ -70,6 +71,9 @@ contract DeployRateAdmin is Script {
         vm.stopBroadcast();
 
         console2.log("Deployed at:", address(pool));
-        console2.log("Next: transferOwnership to the final owner, then have them call acceptOwnership().");
+        console2.log("Borrowing starts paused. OWNER_ADDRESS is already the final owner.");
+        console2.log(
+            "Owner: configure borrower restrictions, caps and settlement signer; verify before funding/unpausing."
+        );
     }
 }
