@@ -464,18 +464,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, E
         remainingDebt = _applyRepayment(loanId, amount);
     }
 
-    /// @notice EOA borrowers use an allowance; deposit wallets use the atomic push batch.
-    function repayWithAllowance(uint256 loanId, uint256 amount)
-        external
-        nonReentrant
-        noActiveRepayment
-        returns (uint256 remainingDebt)
-    {
-        if (amount == 0) revert ZeroAmount();
-        _receiveRepayment(loanId, amount);
-        remainingDebt = _applyRepayment(loanId, amount);
-    }
-
     function settleLoss(
         uint256 loanId,
         uint256 amount,
@@ -485,19 +473,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, E
         bytes calldata signature
     ) external nonReentrant {
         _verifyRepayment(loanId, amount);
-        _authorizeLossSettlement(loanId, amount, maxWriteOff, nonce, deadline, signature);
-        _settleAuthorizedLoss(loanId, amount, maxWriteOff);
-    }
-
-    function settleLossWithAllowance(
-        uint256 loanId,
-        uint256 amount,
-        uint256 maxWriteOff,
-        uint256 nonce,
-        uint256 deadline,
-        bytes calldata signature
-    ) external nonReentrant noActiveRepayment {
-        _receiveRepayment(loanId, amount);
         _authorizeLossSettlement(loanId, amount, maxWriteOff, nonce, deadline, signature);
         _settleAuthorizedLoss(loanId, amount, maxWriteOff);
     }
@@ -529,16 +504,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, E
             if (debt - amount > maxWriteOff) revert WriteOffLimitExceeded();
             _settleLoss(loanId, amount, debt);
         }
-    }
-
-    function _receiveRepayment(uint256 loanId, uint256 amount) internal {
-        if (loanShares[loanId] == 0) revert LoanNotFound();
-        if (msg.sender != loanWallet[loanId]) revert OnlyBorrowerWallet();
-        accrueInterest();
-        uint256 beforeBalance = usdc.balanceOf(address(this));
-        if (amount != 0) usdc.safeTransferFrom(msg.sender, address(this), amount);
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance < beforeBalance || balance - beforeBalance != amount) revert RepaymentAmountMismatch();
     }
 
     /// @notice Exceptional loss recognition when the recorded borrower cannot settle.

@@ -224,7 +224,7 @@ contract DepositWalletRepaymentForkTest is RepaymentForkBase {
     }
 }
 
-contract JuicedAllowanceRepaymentForkTest is RepaymentForkBase {
+contract JuicedDelegatedRepaymentForkTest is RepaymentForkBase {
     address constant LIVE_POOL = 0x98Cd06BFff15eC71be707Ae7214297f65DfFf5aC;
     address constant TREASURY = 0xe48ED751565F1CA658cac5E2bb226Ca2D73196d8;
     address constant TOKEN = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
@@ -233,7 +233,7 @@ contract JuicedAllowanceRepaymentForkTest is RepaymentForkBase {
     IERC20 token;
 
     function setUp() public {
-        _fork("ROBINHOOD_RPC_URL", "ROBINHOOD_FORK_BLOCK", 97_767_524, 4663);
+        _fork("ROBINHOOD_RPC_URL", "ROBINHOOD_FORK_BLOCK", 97_951_750, 4663);
         if (!forkActive) return;
         assertEq(AmplifiLendingPool(LIVE_POOL).asset(), TOKEN);
         assertEq(AmplifiLendingPool(LIVE_POOL).teeOperator(), TREASURY);
@@ -254,15 +254,12 @@ contract JuicedAllowanceRepaymentForkTest is RepaymentForkBase {
         pool.borrow(1, 1_000e6, TREASURY);
     }
 
-    function test_fork_treasuryApprovePartialThenFullWithInterestAndRefund() public onlyFork {
-        vm.prank(TREASURY);
-        token.approve(address(pool), type(uint256).max);
+    function test_fork_treasuryPushPartialThenFullWithInterestAndRefund() public onlyFork {
         vm.roll(block.number + 100);
         vm.warp(block.timestamp + 1 days);
         uint256 debt = pool.loanDebt(1);
         uint256 cash = token.balanceOf(address(pool));
-        vm.prank(TREASURY);
-        pool.repayWithAllowance(1, 200e6);
+        _execute(_calls(1, 200e6, 200e6, false));
         assertApproxEqAbs(pool.loanDebt(1), debt - 200e6, 1);
         assertGt(pool.loanPrincipal(1), 800e6);
         assertEq(token.balanceOf(address(pool)), cash + 200e6);
@@ -272,42 +269,55 @@ contract JuicedAllowanceRepaymentForkTest is RepaymentForkBase {
         debt = pool.loanDebt(1);
         deal(TOKEN, TREASURY, debt + 10e6);
         cash = token.balanceOf(address(pool));
-        vm.prank(TREASURY);
-        pool.repayWithAllowance(1, debt + 10e6);
+        _execute(_calls(1, debt + 10e6, debt + 10e6, true));
         assertEq(pool.loanDebt(1), 0);
         assertEq(pool.totalBorrowShares(), 0);
         assertEq(pool.totalBadDebtRealized(), 0);
         assertEq(token.balanceOf(TREASURY), 10e6);
         assertEq(token.balanceOf(address(pool)), cash + debt);
-    }
-
-    function test_fork_missingApprovalAndWrongCallerPreserveFundsAndDebt() public onlyFork {
-        uint256 cash = token.balanceOf(address(pool));
-        vm.prank(TREASURY);
-        vm.expectRevert();
-        pool.repayWithAllowance(1, 200e6);
-        vm.prank(TREASURY);
-        token.approve(address(pool), 200e6);
-        vm.expectRevert(AmplifiLendingPool.OnlyBorrowerWallet.selector);
-        pool.repayWithAllowance(1, 200e6);
-        assertEq(token.balanceOf(TREASURY), 1_000e6);
-        assertEq(token.balanceOf(address(pool)), cash);
-        assertEq(pool.loanDebt(1), 1_000e6);
-        assertEq(token.allowance(TREASURY, address(pool)), 200e6);
-    }
-
-    function test_fork_treasuryDelegatedBatchApprovesAndRepaysAtomically() public onlyFork {
-        WalletCall[] memory calls = new WalletCall[](2);
-        calls[0] = WalletCall(TOKEN, 0, abi.encodeCall(token.approve, (address(pool), 200e6)));
-        calls[1] = WalletCall(address(pool), 0, abi.encodeCall(pool.repayWithAllowance, (1, 200e6)));
-        vm.prank(TREASURY);
-        ISimple7702Fork(TREASURY).executeBatch(calls);
-        assertEq(token.balanceOf(TREASURY), 800e6);
-        assertEq(pool.loanDebt(1), 800e6);
         assertEq(token.allowance(TREASURY, address(pool)), 0);
     }
 
-    function test_fork_treasurySignedLossPullsOnlyAuthorizedAmount() public onlyFork {
+    function test_fork_failedTreasuryBatchRollsBackTransfer() public onlyFork {
+        uint256 cash = token.balanceOf(address(pool));
+        WalletCall[] memory calls = _calls(1, 200e6, 201e6, false);
+        vm.prank(TREASURY);
+        vm.expectRevert();
+        ISimple7702Fork(TREASURY).executeBatch(calls);
+        assertEq(token.balanceOf(TREASURY), 1_000e6);
+        assertEq(token.balanceOf(address(pool)), cash);
+        assertEq(pool.loanDebt(1), 1_000e6);
+        _execute(_calls(1, 200e6, 200e6, false));
+        assertEq(pool.loanDebt(1), 800e6);
+    }
+
+    function test_fork_strangerCannotExecuteTreasuryBatch() public onlyFork {
+        WalletCall[] memory calls = _calls(1, 200e6, 200e6, false);
+        vm.expectRevert();
+        ISimple7702Fork(TREASURY).executeBatch(calls);
+        assertEq(token.balanceOf(TREASURY), 1_000e6);
+        assertEq(pool.loanDebt(1), 1_000e6);
+    }
+
+    function test_fork_freshEoaCheatcodeDelegationUsesRealSimple7702Account() public onlyFork {
+        uint256 testKey = 0xF07702;
+        address fresh = vm.addr(testKey);
+        address delegate = 0xe6Cae83BdE06E4c305530e199D7217f42808555B;
+        assertEq(fresh.code.length, 0);
+        vm.prank(TREASURY);
+        pool.borrow(2, 500e6, fresh);
+        WalletCall[] memory calls = _calls(2, 100e6, 100e6, false);
+        vm.signAndAttachDelegation(delegate, testKey);
+        vm.prank(fresh, fresh);
+        ISimple7702Fork(fresh).executeBatch(calls);
+        assertEq(fresh.code, abi.encodePacked(hex"ef0100", delegate));
+        assertEq(pool.loanWallet(2), fresh);
+        assertEq(pool.loanDebt(2), 400e6);
+        assertEq(token.balanceOf(fresh), 400e6);
+        assertEq(token.allowance(fresh, address(pool)), 0);
+    }
+
+    function test_fork_treasurySignedLossPushesOnlyAuthorizedAmount() public onlyFork {
         vm.roll(block.number + 100);
         vm.warp(block.timestamp + 1 days);
         uint256 debt = pool.loanDebt(1);
@@ -325,13 +335,33 @@ contract JuicedAllowanceRepaymentForkTest is RepaymentForkBase {
             keccak256(abi.encode(pool.LOSS_SETTLEMENT_TYPEHASH(), 1, TREASURY, 400e6, debt - 400e6, 1, deadline));
         (uint8 v, bytes32 r, bytes32 s) =
             vm.sign(SETTLEMENT_KEY, keccak256(abi.encodePacked("\x19\x01", domain, contents)));
-        vm.startPrank(TREASURY);
-        token.approve(address(pool), 400e6);
-        pool.settleLossWithAllowance(1, 400e6, debt - 400e6, 1, deadline, abi.encodePacked(r, s, v));
-        vm.stopPrank();
+        WalletCall[] memory calls = _calls(1, 400e6, 400e6, false);
+        calls[2].data =
+            abi.encodeCall(pool.settleLoss, (1, 400e6, debt - 400e6, 1, deadline, abi.encodePacked(r, s, v)));
+        _execute(calls);
         assertEq(token.balanceOf(TREASURY), 600e6);
         assertEq(pool.loanDebt(1), 0);
         assertEq(pool.totalBadDebtRealized(), debt - 400e6);
         assertEq(token.allowance(TREASURY, address(pool)), 0);
+    }
+
+    function _execute(WalletCall[] memory calls) internal {
+        vm.prank(TREASURY, TREASURY);
+        ISimple7702Fork(TREASURY).executeBatch(calls);
+    }
+
+    function _calls(uint256 id, uint256 transferred, uint256 claimed, bool full)
+        internal
+        view
+        returns (WalletCall[] memory calls)
+    {
+        calls = new WalletCall[](3);
+        calls[0] = WalletCall(address(pool), 0, abi.encodeCall(pool.beginRepay, (id)));
+        calls[1] = WalletCall(TOKEN, 0, abi.encodeCall(token.transfer, (address(pool), transferred)));
+        calls[2] = WalletCall(
+            address(pool),
+            0,
+            full ? abi.encodeCall(pool.repayFull, (id, claimed)) : abi.encodeCall(pool.repay, (id, claimed))
+        );
     }
 }

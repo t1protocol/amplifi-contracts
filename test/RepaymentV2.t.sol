@@ -118,50 +118,7 @@ contract RepaymentV2Test is Test {
         fresh.borrow(1, 1, wallet);
     }
 
-    function test_eoaPullPartialThenFullRepayment() public {
-        pool.borrow(1, 100e6, wallet);
-        vm.startPrank(wallet);
-        token.approve(address(pool), 100e6);
-        assertEq(pool.repayWithAllowance(1, 40e6), 60e6);
-        assertEq(pool.loanPrincipal(1), 60e6);
-        assertEq(pool.repayWithAllowance(1, 60e6), 0);
-        vm.stopPrank();
-        assertEq(pool.totalBorrowAssets(), 0);
-        assertEq(pool.totalBadDebtRealized(), 0);
-    }
-
-    function test_eoaPullCannotSpendAnotherWalletAllowanceOrCreditDonation() public {
-        pool.borrow(1, 100e6, wallet);
-        token.mint(address(this), 100e6);
-        token.transfer(address(pool), 100e6);
-        vm.prank(wallet);
-        token.approve(address(pool), 100e6);
-        vm.prank(other);
-        vm.expectRevert(AmplifiLendingPool.OnlyBorrowerWallet.selector);
-        pool.repayWithAllowance(1, 100e6);
-        assertEq(token.balanceOf(wallet), 100e6);
-        vm.prank(wallet);
-        token.approve(address(pool), 0);
-        vm.prank(wallet);
-        vm.expectRevert();
-        pool.repayWithAllowance(1, 100e6);
-        assertEq(pool.loanDebt(1), 100e6);
-    }
-
-    function test_eoaLossRequiresSameAuthorizedPermit() public {
-        pool.borrow(1, 100e6, wallet);
-        uint256 deadline = block.timestamp + 300;
-        bytes memory sig = _signature(1, 40e6, 60e6, 1, deadline, SIGNER_KEY);
-        vm.startPrank(wallet);
-        token.approve(address(pool), 40e6);
-        pool.settleLossWithAllowance(1, 40e6, 60e6, 1, deadline, sig);
-        vm.stopPrank();
-        assertEq(token.balanceOf(wallet), 60e6);
-        assertEq(pool.totalBadDebtRealized(), 60e6);
-        assertEq(pool.loanDebt(1), 0);
-    }
-
-    function test_eoaFeeOnTransferMismatchRollsBack() public {
+    function test_pushFeeOnTransferMismatchRollsBack() public {
         TaxedRepaymentToken taxed = new TaxedRepaymentToken();
         AmplifiLendingPool fresh =
             new AmplifiLendingPool(address(taxed), address(this), address(this), 0, 8500, 0, 0, new address[](0));
@@ -169,14 +126,12 @@ contract RepaymentV2Test is Test {
         taxed.mint(address(this), 100e6);
         taxed.approve(address(fresh), 100e6);
         fresh.deposit(100e6);
-        fresh.borrow(1, 50e6, wallet);
+        RepaymentWallet batch = new RepaymentWallet();
+        fresh.borrow(1, 50e6, address(batch));
         taxed.enableTax();
-        vm.startPrank(wallet);
-        taxed.approve(address(fresh), 50e6);
         vm.expectRevert(AmplifiLendingPool.RepaymentAmountMismatch.selector);
-        fresh.repayWithAllowance(1, 50e6);
-        vm.stopPrank();
-        assertEq(taxed.balanceOf(wallet), 50e6);
+        batch.pay(fresh, taxed, 1, 50e6, 50e6);
+        assertEq(taxed.balanceOf(address(batch)), 50e6);
         assertEq(taxed.balanceOf(address(fresh)), 50e6);
         assertEq(fresh.loanDebt(1), 50e6);
     }

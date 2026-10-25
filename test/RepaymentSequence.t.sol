@@ -124,8 +124,9 @@ contract RepaymentSequenceTest is Test {
         token.mint(borrower, sent);
         uint256 beforeBalance = token.balanceOf(borrower);
         vm.startPrank(borrower);
-        token.approve(address(pool), sent);
-        pool.repayWithAllowance(id, sent);
+        pool.beginRepay(id);
+        token.transfer(address(pool), sent);
+        pool.repay(id, sent);
         vm.stopPrank();
         uint256 received = beforeBalance - token.balanceOf(borrower);
         paid += received;

@@ -23,9 +23,24 @@ ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com \
 forge test --match-path test/RepaymentExecutionFork.t.sol -vv
 ```
 
-Defaults are pinned to Polygon block 96,163,226 and Robinhood block 97,767,524.
+Defaults are pinned to Polygon block 96,163,226 and Robinhood block 97,951,750.
 Override with `POLYGON_FORK_BLOCK` and `ROBINHOOD_FORK_BLOCK`. Missing RPC variables
-produce explicit skips; configured RPC failures fail the tests.
+produce explicit skips; configured RPC failures fail the tests. Use an archive
+RPC or an explicit newer block override if a public endpoint prunes the pinned state.
+
+## EIP-7702 delegation without an RPC
+
+```sh
+forge test --match-contract Repayment7702Test -vv
+```
+
+These tests use `vm.signAndAttachDelegation` with a dummy EOA key and a self-call
+batch executor. They assert the EOA's delegation marker and recorded borrower
+identity, then check partial/full payments, refunds, signed loss, failed-batch
+rollback, unauthorized callers and two loan repayments in one batch. No repayment
+token approval is used. The test selects Prague execution rules with
+`vm.setEvmVersion`; production bytecode remains compiled for Cancun. The local
+executor is a test fixture, not the JuicedAccount implementation.
 
 ## Polygon deposit wallet
 
@@ -50,21 +65,24 @@ Factory and wallet interfaces were checked against their verified Polygon code:
 - [Factory](https://polygonscan.com/address/0x00000000000Fb5C9ADea0298D729A0CB3823Cc07#code)
 - [Beacon implementation at the pinned block](https://polygonscan.com/address/0xf7f27C29e60fe6325beF8dA7F93250353d2e3294#code)
 
-## Robinhood treasury allowance
+## Robinhood delegated treasury
 
 Fixtures check the existing pool's asset and operator against the real USDG
 token and treasury. The treasury's live EIP-7702 Simple7702Account delegation is
-preserved. Tests exercise ordinary treasury calls and its actual delegated
-`executeBatch`, including approval, partial/full payment, accrued interest,
-refunds, unauthorized callers, missing approval and signed loss settlement.
+preserved. Tests exercise its actual delegated `executeBatch` with the atomic
+`beginRepay -> transfer -> repay/repayFull/settleLoss` sequence, including
+partial/full payment, accrued interest, refunds, unauthorized callers, failed-batch
+rollback and signed loss settlement. Another test uses `vm.signAndAttachDelegation`
+to delegate a fresh test EOA to the real deployed Simple7702Account implementation
+and repay a loan recorded against that EOA. No repayment token approval is used.
 Token balances are seeded with Foundry `deal`; no real funds or keys are used.
 
-Passing these tests establishes that the allowance API works with that token
+Passing these tests establishes that the push API works with that token
 and treasury execution code. It does not establish Juiced application integration.
 The Juiced source's `contracts/src/JuicedAccount.sol::_repayPool` currently pushes
 tokens and calls the old `repay` without `beginRepay`; that path requires explicit
-v2 adaptation and end-to-end coverage before migration. The treasury allowance
-API alone does not make those user-account contracts compatible.
+v2 adaptation and end-to-end coverage before migration. Testing the treasury's
+executor alone does not make those user-account contracts compatible.
 
 Neither fork sends transactions to a live network. They test new pool deployments,
 not upgrades to existing deployed pools.
