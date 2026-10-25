@@ -47,7 +47,9 @@ last depositor's full-share quote can exceed actual cash because of virtual
 assets/shares. The deterministic regression is short by 333 microdollars
 ($0.000333): full-share withdrawal reverts, while withdrawing the available asset
 amount succeeds and leaves virtual-offset dust shares. The test expects the
-current revert; passing it does not mean the defect is fixed. A correction to
+current revert; passing it does not mean the defect is fixed. The same 333-unit
+shortfall and revert reproduce against unchanged `develop`, so this predates the
+repayment redesign. A correction to
 withdrawal/conversion semantics requires separate specific human approval.
 
 Run the execution forks:
