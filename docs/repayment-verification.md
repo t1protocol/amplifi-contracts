@@ -15,6 +15,41 @@ Final token conservation is exact; intermediate comparisons allow micro-unit
 rounding differences. This deterministic scenario is not a stateful invariant
 fuzzer or a test of different utilization-dependent rates.
 
+## Stateful accounting campaign
+
+```sh
+forge test --match-contract RepaymentInvariantTest -vv
+# Larger campaign:
+FOUNDRY_INVARIANT_RUNS=2048 forge test --match-contract RepaymentInvariantTest -vv
+```
+
+The default is 512 sequences of 128 calls with unexpected reverts treated as
+failures. Nine actions vary deposits, borrowing, time/block progression, partial
+and full repayment, signed losses, withdrawals, donations, fee collection and
+same-block deposit/withdraw round trips. Three initial loans start above the
+utilization kink. The model covers four borrower wallets and three depositors,
+with twelve reusable live-loan slots and a one-year time horizon.
+
+An independent dollar model bounds interest and principal using elapsed time and
+the rate curve, without reading the pool's index or conversion helpers. Small
+integer intervals account for share/aggregate rounding; a width assertion keeps
+them from becoming vacuous. Every step checks exact pool cash, total debt shares,
+principal, fee/loss bounds and depositor share supply. Each sequence also closes
+all surviving loans and checks that no debt shares remain. Same-block round trips
+must not return more tokens than deposited. These are bounded tests, not a proof
+for all durations, tokens or adversarial callbacks.
+
+### Known loss/redemption edge case
+
+`test_knownFullRedemptionAfterLossRevertsButCashCanBeWithdrawnByAssets` records a
+remaining withdrawal issue. After a loss and repayment of surviving loans, the
+last depositor's full-share quote can exceed actual cash because of virtual
+assets/shares. The deterministic regression is short by 333 microdollars
+($0.000333): full-share withdrawal reverts, while withdrawing the available asset
+amount succeeds and leaves virtual-offset dust shares. The test expects the
+current revert; passing it does not mean the defect is fixed. A correction to
+withdrawal/conversion semantics requires separate specific human approval.
+
 Run the execution forks:
 
 ```sh

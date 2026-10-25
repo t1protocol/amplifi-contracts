@@ -12,6 +12,11 @@ line_length = 120
 tab_width = 4
 bracket_spacing = false
 
+[profile.default.invariant]
+runs = 512
+depth = 128
+fail_on_revert = true
+
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
 arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
