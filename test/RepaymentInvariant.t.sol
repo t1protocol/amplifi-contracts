@@ -330,7 +330,7 @@ contract RepaymentInvariantTest is StdInvariant, Test {
         handler.closeAllLoans();
     }
 
-    function test_knownFullRedemptionAfterLossRevertsButCashCanBeWithdrawnByAssets() public {
+    function test_finalDepositorRedeemsAllSharesAfterLoss() public {
         handler.settleLoss(1, 15377);
         handler.closeAllLoans();
         AmplifiLendingPool pool = handler.pool();
@@ -344,14 +344,16 @@ contract RepaymentInvariantTest is StdInvariant, Test {
         address last = handler.lenders(2);
         uint256 lastShares = pool.balanceOf(last);
         uint256 cash = token.balanceOf(address(pool));
-        assertEq(pool.sharesToAssets(lastShares) - cash, 333);
+        uint256 virtualQuote = lastShares * (pool.totalAssets() + 1e3) / (pool.totalSupply() + 1e3);
+        assertEq(virtualQuote - cash, 333);
+        assertEq(pool.sharesToAssets(lastShares), cash);
+        assertEq(pool.previewRedeem(lastShares), cash);
+        assertEq(pool.maxRedeem(last), lastShares);
+        assertEq(pool.maxWithdraw(last), cash);
         vm.prank(last);
-        vm.expectRevert(AmplifiLendingPool.InsufficientLiquidity.selector);
-        pool.withdraw(lastShares);
-        assertEq(pool.balanceOf(last), lastShares);
-        vm.prank(last);
-        pool.withdrawAssets(cash);
+        assertEq(pool.withdraw(lastShares), cash);
         assertEq(token.balanceOf(address(pool)), 0);
-        assertGt(pool.balanceOf(last), 0, "unfunded virtual-offset dust shares remain");
+        assertEq(pool.balanceOf(last), 0);
+        assertEq(pool.totalSupply(), 0);
     }
 }

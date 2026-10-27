@@ -39,18 +39,26 @@ all surviving loans and checks that no debt shares remain. Same-block round trip
 must not return more tokens than deposited. These are bounded tests, not a proof
 for all durations, tokens or adversarial callbacks.
 
-### Known loss/redemption edge case
+### Final redemption after loss
 
-`test_knownFullRedemptionAfterLossRevertsButCashCanBeWithdrawnByAssets` records a
-remaining withdrawal issue. After a loss and repayment of surviving loans, the
-last depositor's full-share quote can exceed actual cash because of virtual
-assets/shares. The deterministic regression is short by 333 microdollars
-($0.000333): full-share withdrawal reverts, while withdrawing the available asset
-amount succeeds and leaves virtual-offset dust shares. The test expects the
-current revert; passing it does not mean the defect is fixed. The same 333-unit
-shortfall and revert reproduce against unchanged `develop`, so this predates the
-repayment redesign. A correction to
-withdrawal/conversion semantics requires separate specific human approval.
+`test_finalDepositorRedeemsAllSharesAfterLoss` covers the prior 333-microdollar
+($0.000333) overquote after loss. When all loan shares are settled and a redemption
+burns the entire real share supply, its quote is capped at net LP assets.
+`previewRedeem`, `convertToAssets`, `maxWithdraw` and `maxRedeem` reflect that exit.
+Partial redemptions and exits with outstanding loans retain their existing quotes
+and liquidity checks. Protocol fees remain excluded from LP assets.
+
+The cap never increases a virtual-offset quote. The final holder must not receive
+all cash unconditionally: that would release the virtual-share reserve and weaken
+donation-attack protection. Asset-amount withdrawals retain their round-up rule
+and may leave worthless dust shares after emptying LP cash. A fully lost pool
+reports zero redeemable assets; the existing ZeroAmount guard still rejects a
+zero-asset redemption.
+
+`RedemptionAfterLossTest` exercises fee-bearing losses, both share exit methods,
+delegated allowance and receiver checks, partial withdrawals, outstanding loans,
+donations, both asset-withdrawal wrappers and an empty-pool restart. A fuzz case
+checks token conservation and fee reserves through further losses and donations.
 
 Run the execution forks:
 

@@ -686,7 +686,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, E
     }
 
     function sharesToAssets(uint256 shares) public view returns (uint256) {
-        return (shares * (totalAssets() + VIRTUAL_ASSETS)) / (totalSupply() + VIRTUAL_SHARES);
+        uint256 assets = totalAssets();
+        uint256 supply = totalSupply();
+        uint256 quoted = (shares * (assets + VIRTUAL_ASSETS)) / (supply + VIRTUAL_SHARES);
+        // Virtual offsets can overquote the final settled redemption after a loss.
+        if (shares != 0 && shares == supply && totalBorrowShares == 0) return Math.min(quoted, assets);
+        return quoted;
     }
 
     function assetsToShares(uint256 assets) public view returns (uint256) {
@@ -711,7 +716,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, E
 
     function maxRedeem(address _owner) external view returns (uint256) {
         uint256 ownerShares = balanceOf(_owner);
-        uint256 liquidityShares = assetsToShares(availableLiquidity());
+        uint256 liquidity = availableLiquidity();
+        if (ownerShares != 0 && ownerShares == totalSupply() && totalBorrowShares == 0 && liquidity != 0) {
+            return ownerShares;
+        }
+        uint256 liquidityShares = assetsToShares(liquidity);
         return ownerShares < liquidityShares ? ownerShares : liquidityShares;
     }
 
