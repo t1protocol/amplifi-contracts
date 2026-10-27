@@ -11,8 +11,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// Optionally pin the fork:
 ///   POLYGON_FORK_BLOCK=<block> POLYGON_RPC_URL=... forge test --match-contract AmplifiLendingPoolForkTest -vv
 ///
-/// If POLYGON_RPC_URL is unset, all tests in this file skip silently so the regular suite
-/// still runs cleanly.
+/// Without POLYGON_RPC_URL, tests report an explicit skip.
 contract AmplifiLendingPoolForkTest is Test {
     // Polygon mainnet addresses
     address constant PUSD = 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB;
@@ -69,13 +68,15 @@ contract AmplifiLendingPoolForkTest is Test {
         pool = new AmplifiLendingPool(
             PUSD, owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, new address[](0)
         );
+        vm.prank(owner);
+        pool.setBorrowPaused(false);
 
         deal(PUSD, lender1, 100_000 * 1e6);
         deal(PUSD, lender2, 100_000 * 1e6);
     }
 
     modifier onlyFork() {
-        if (!forkActive) return;
+        vm.skip(!forkActive);
         _;
     }
 
@@ -130,11 +131,11 @@ contract AmplifiLendingPoolForkTest is Test {
         uint256 debt = pool.loanDebt(1);
         assertGt(debt, borrowAmount, "interest accrued");
         deal(PUSD, borrowerWallet, debt);
-        vm.prank(borrowerWallet);
-        pusd.approve(address(pool), debt);
-
-        vm.prank(teeOperator);
-        pool.repay(1, type(uint256).max);
+        vm.startPrank(borrowerWallet);
+        pool.beginRepay(1);
+        pusd.transfer(address(pool), debt);
+        pool.repay(1, debt);
+        vm.stopPrank();
 
         // Lender withdraws
         uint256 lenderShares = pool.balanceOf(lender1);
@@ -146,7 +147,7 @@ contract AmplifiLendingPoolForkTest is Test {
         assertGt(finalBalance, 100_000 * 1e6, "lender earned interest");
     }
 
-    function test_fork_partialRepay_badDebtAbsorbedByLender() public onlyFork {
+    function test_fork_partialRepay_keepsResidualDebt() public onlyFork {
         uint256 deposit1 = 50_000 * 1e6;
         vm.startPrank(lender1);
         pusd.approve(address(pool), deposit1);
@@ -169,11 +170,16 @@ contract AmplifiLendingPoolForkTest is Test {
 
         uint256 lenderValueBefore = pool.sharesToAssets(pool.balanceOf(lender1));
 
-        vm.prank(teeOperator);
+        vm.startPrank(borrowerWallet);
+        pool.beginRepay(1);
+        pusd.transfer(address(pool), fundBalance);
         pool.repay(1, fundBalance);
+        vm.stopPrank();
 
         uint256 lenderValueAfter = pool.sharesToAssets(pool.balanceOf(lender1));
-        assertLt(lenderValueAfter, lenderValueBefore, "bad debt reduces lender share value");
+        assertApproxEqAbs(lenderValueAfter, lenderValueBefore, 1);
+        assertGt(pool.loanDebt(1), 0);
+        assertEq(pool.totalBadDebtRealized(), 0);
     }
 
     // ── ERC-4626 entry points on real pUSD ──────────────────────────────
@@ -226,7 +232,7 @@ contract AmplifiLendingPoolForkTest is Test {
         assertEq(pusd.balanceOf(lender1), walletBalance, "no value lost on round-trip");
     }
 
-    function test_fork_existingPoolsAlive() public view onlyFork {
+    function test_fork_existingPoolsAlive() public onlyFork {
         // Smoke test: existing pools respond and report sane totals on the forked block.
         // We can't safely call state-changing methods on them, but reading view fns confirms
         // the addresses are deployed and the ABI matches.

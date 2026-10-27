@@ -19,55 +19,46 @@ contract MockUSDC is ERC20 {
     }
 }
 
+contract MockToken18 is ERC20 {
+    constructor() ERC20("Token", "TKN") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
 contract CollateralEscrowTest is Test {
     CollateralEscrow escrow;
     MockUSDC usdc;
 
     address owner = makeAddr("owner");
-    address seizureRecipient = makeAddr("seizureRecipient");
     address relayer = makeAddr("relayer");
     address depositor;
     uint256 depositorKey;
     address attester;
     uint256 attesterKey;
-    address seizer;
-    uint256 seizerKey;
 
     // Fixture pins from tests/fixtures/collateral-escrow-vectors.json (amplifi repo).
     bytes32 constant FIXTURE_RELEASE_TYPEHASH = 0xb5c941473b37fdf1f7fff5174464d2a29eefc0abaec9f30c55dfa356d95bc25f;
-    bytes32 constant FIXTURE_SEIZURE_TYPEHASH = 0xe5fd0c81556c04ea6f3492da83362fa13f90c119b6771dcd3a3dcb761a638901;
     bytes32 constant FIXTURE_DOMAIN_SEPARATOR = 0x5c0467ce52fb713f89440a93141120d44e8366c7971a614b4fc4378ff30abfdd;
     bytes32 constant FIXTURE_RELEASE_STRUCT_HASH = 0x87458ba6dee17e41d08f8a4e297c9deb8aad9469cea628e6343098de23f9c1fa;
     bytes32 constant FIXTURE_RELEASE_DIGEST = 0x620b29ab06f41352bef9f72ff8a559f97840202b16a4e8311c6dcae80de5d261;
-    bytes32 constant FIXTURE_SEIZURE_STRUCT_HASH = 0x5a86014e79bed872caace43abf7e6f093a842de78e66c4721650e2a877e7ccf5;
-    bytes32 constant FIXTURE_SEIZURE_DIGEST = 0x62d135222527320dd9c1a60de8dbb5b67253751976af034053942d0383093f23;
     address constant FIXTURE_VERIFYING_CONTRACT = 0x1111111111111111111111111111111111111111;
     address constant FIXTURE_SIGNER = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
     address constant FIXTURE_ACCOUNT = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
     address constant FIXTURE_TOKEN = 0x2222222222222222222222222222222222222222;
-    address constant FIXTURE_RECIPIENT = 0x3333333333333333333333333333333333333333;
     bytes constant FIXTURE_RELEASE_SIG =
         hex"dc94870e4b9a07cdf945d4f20c73fdcc9b44fc61ad77863261194bdf07bce2203fbb5a9ae446e8594ae5553bf87d8e635a6981ab6f3cb4ca66e3daff323e04d51c";
-    bytes constant FIXTURE_SEIZURE_SIG =
-        hex"49c9dc4eee413058315d49cd605419e35dfe7142ec53d2a9ba0264eb212f614e3c8a78cbb011dc3af50c57416f5d6385a3e44c3575891e014ef59af360420ff01c";
 
     uint256 constant BASE_TIME = 1_760_000_000;
 
     function setUp() public {
         (depositor, depositorKey) = makeAddrAndKey("depositor");
         (attester, attesterKey) = makeAddrAndKey("attester");
-        (seizer, seizerKey) = makeAddrAndKey("seizer");
 
         vm.warp(BASE_TIME);
         usdc = new MockUSDC();
-        escrow = new CollateralEscrow(owner);
-
-        vm.startPrank(owner);
-        escrow.setAttester(attester, true);
-        escrow.setSeizer(seizer, true);
-        escrow.setCollateralAllowed(address(usdc), true);
-        escrow.setSeizureRecipient(seizureRecipient, true);
-        vm.stopPrank();
+        escrow = new CollateralEscrow(owner, address(usdc), attester, 100_000_000, 1_000_000_000, 30 days);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -137,26 +128,10 @@ contract CollateralEscrowTest is Test {
         sig = _signRelease(attesterKey, r);
     }
 
-    function _seizure(uint256 amount, uint256 attestationId)
-        internal
-        view
-        returns (CollateralEscrow.CollateralSeizure memory)
-    {
-        return CollateralEscrow.CollateralSeizure({
-            account: depositor,
-            token: address(usdc),
-            amount: amount,
-            recipient: seizureRecipient,
-            attestationId: attestationId,
-            deadline: block.timestamp + 7 days
-        });
-    }
-
     // ── Vector reproduction (fixture domain: chainId 31337, verifyingContract 0x1111…1111) ──
 
     function test_vectors_typehashesMatchFixture() public view {
         assertEq(escrow.COLLATERAL_RELEASE_TYPEHASH(), FIXTURE_RELEASE_TYPEHASH);
-        assertEq(escrow.COLLATERAL_SEIZURE_TYPEHASH(), FIXTURE_SEIZURE_TYPEHASH);
     }
 
     function test_vectors_domainSeparatorMatchesFixture() public {
@@ -173,26 +148,6 @@ contract CollateralEscrowTest is Test {
             MessageHashUtils.toTypedDataHash(_domainSeparator(31337, FIXTURE_VERIFYING_CONTRACT), structHash);
         assertEq(digest, FIXTURE_RELEASE_DIGEST);
         assertEq(ECDSA.recover(digest, FIXTURE_RELEASE_SIG), FIXTURE_SIGNER);
-    }
-
-    function test_vectors_seizureDigestAndSignerMatchFixture() public {
-        vm.chainId(31337);
-        bytes32 structHash = keccak256(
-            abi.encode(
-                escrow.COLLATERAL_SEIZURE_TYPEHASH(),
-                FIXTURE_ACCOUNT,
-                FIXTURE_TOKEN,
-                uint256(1_000_000),
-                FIXTURE_RECIPIENT,
-                uint256(43),
-                uint256(1_767_225_600)
-            )
-        );
-        assertEq(structHash, FIXTURE_SEIZURE_STRUCT_HASH);
-        bytes32 digest =
-            MessageHashUtils.toTypedDataHash(_domainSeparator(31337, FIXTURE_VERIFYING_CONTRACT), structHash);
-        assertEq(digest, FIXTURE_SEIZURE_DIGEST);
-        assertEq(ECDSA.recover(digest, FIXTURE_SEIZURE_SIG), FIXTURE_SIGNER);
     }
 
     // ── Deposit ───────────────────────────────────────────────────────────
@@ -339,82 +294,6 @@ contract CollateralEscrowTest is Test {
         escrow.withdrawWithAttestation(r, sig);
     }
 
-    // ── Seize ─────────────────────────────────────────────────────────────
-
-    function test_seize_movesCollateralToAllowlistedRecipient() public {
-        _deposit(depositor, 5_000_000);
-        vm.prank(seizer);
-        escrow.seize(_seizure(2_000_000, 10));
-
-        assertEq(usdc.balanceOf(seizureRecipient), 2_000_000);
-        assertEq(escrow.balances(depositor, address(usdc)), 3_000_000);
-        assertTrue(escrow.consumed(10));
-    }
-
-    function test_seize_attesterCannotSeize() public {
-        _deposit(depositor, 5_000_000);
-        vm.prank(attester);
-        vm.expectRevert(abi.encodeWithSignature("OnlySeizer()"));
-        escrow.seize(_seizure(1_000_000, 11));
-    }
-
-    function test_seize_seizerCannotAttest() public {
-        _deposit(depositor, 5_000_000);
-        (CollateralEscrow.CollateralRelease memory r,) = _releaseFor(depositor, 1_000_000, 12);
-        bytes memory sig = _signRelease(seizerKey, r);
-
-        vm.expectRevert(abi.encodeWithSignature("InvalidAttester()"));
-        escrow.withdrawWithAttestation(r, sig);
-    }
-
-    function test_seize_nonAllowlistedRecipientReverts() public {
-        _deposit(depositor, 5_000_000);
-        CollateralEscrow.CollateralSeizure memory s = _seizure(1_000_000, 13);
-        s.recipient = makeAddr("attacker");
-
-        vm.prank(seizer);
-        vm.expectRevert(abi.encodeWithSignature("RecipientNotAllowed()"));
-        escrow.seize(s);
-    }
-
-    function test_seize_balanceClampsAtZero() public {
-        _deposit(depositor, 1_000_000);
-        usdc.mint(address(this), 2_000_000);
-        usdc.approve(address(escrow), 2_000_000);
-        escrow.fundCushion(address(usdc), 2_000_000);
-
-        vm.prank(seizer);
-        escrow.seize(_seizure(2_500_000, 14));
-        assertEq(escrow.balances(depositor, address(usdc)), 0);
-    }
-
-    function test_seize_pausedReverts() public {
-        _deposit(depositor, 5_000_000);
-        vm.prank(owner);
-        escrow.pause();
-        vm.prank(seizer);
-        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
-        escrow.seize(_seizure(1_000_000, 15));
-    }
-
-    function test_seize_consumedIdSharedAcrossReleaseAndSeize() public {
-        _deposit(depositor, 5_000_000);
-
-        // Release consumes id 20; a seizure reusing it must revert.
-        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 1_000_000, 20);
-        escrow.withdrawWithAttestation(r, sig);
-        vm.prank(seizer);
-        vm.expectRevert(abi.encodeWithSignature("AttestationConsumed()"));
-        escrow.seize(_seizure(1_000_000, 20));
-
-        // Seizure consumes id 21; a release reusing it must revert.
-        vm.prank(seizer);
-        escrow.seize(_seizure(1_000_000, 21));
-        (CollateralEscrow.CollateralRelease memory r2, bytes memory sig2) = _releaseFor(depositor, 1_000_000, 21);
-        vm.expectRevert(abi.encodeWithSignature("AttestationConsumed()"));
-        escrow.withdrawWithAttestation(r2, sig2);
-    }
-
     // ── cancelAttestation ─────────────────────────────────────────────────
 
     function test_cancelAttestation_marksConsumedWithoutTransfer() public {
@@ -431,7 +310,7 @@ contract CollateralEscrowTest is Test {
     }
 
     function test_cancelAttestation_nonAttesterReverts() public {
-        vm.prank(seizer);
+        vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSignature("OnlyAttester()"));
         escrow.cancelAttestation(31);
     }
@@ -441,7 +320,7 @@ contract CollateralEscrowTest is Test {
     function test_caps_perAttestationCapEnforced() public {
         _deposit(depositor, 10_000_000);
         vm.prank(owner);
-        escrow.setCaps(1_500_000, 0);
+        escrow.setTokenCaps(address(usdc), 1_500_000, 3_000_000);
 
         (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 2_000_000, 40);
         vm.expectRevert(abi.encodeWithSignature("PerAttestationCapExceeded()"));
@@ -455,7 +334,7 @@ contract CollateralEscrowTest is Test {
     function test_caps_dailyLimitEnforcedThenResetsAfterADay() public {
         _deposit(depositor, 10_000_000);
         vm.prank(owner);
-        escrow.setCaps(0, 3_000_000);
+        escrow.setTokenCaps(address(usdc), 3_000_000, 3_000_000);
 
         (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 3_000_000, 50);
         escrow.withdrawWithAttestation(r, sig);
@@ -480,13 +359,9 @@ contract CollateralEscrowTest is Test {
         vm.expectRevert(err);
         escrow.setAttester(attacker, true);
         vm.expectRevert(err);
-        escrow.setSeizer(attacker, true);
-        vm.expectRevert(err);
         escrow.setCollateralAllowed(address(usdc), false);
         vm.expectRevert(err);
-        escrow.setSeizureRecipient(attacker, true);
-        vm.expectRevert(err);
-        escrow.setCaps(1, 1);
+        escrow.setTokenCaps(address(usdc), 1, 1);
         vm.expectRevert(err);
         escrow.setMaxAttestationTtl(1 days);
         vm.expectRevert(err);
@@ -501,11 +376,7 @@ contract CollateralEscrowTest is Test {
         vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
         escrow.setAttester(address(0), true);
         vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
-        escrow.setSeizer(address(0), true);
-        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
         escrow.setCollateralAllowed(address(0), true);
-        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
-        escrow.setSeizureRecipient(address(0), true);
         vm.expectRevert(abi.encodeWithSignature("ZeroTtl()"));
         escrow.setMaxAttestationTtl(0);
         vm.stopPrank();
@@ -539,5 +410,139 @@ contract CollateralEscrowTest is Test {
         vm.prank(newOwner);
         escrow.acceptOwnership();
         assertEq(escrow.owner(), newOwner);
+    }
+
+    function test_constructor_configuresFinalOwnerWithoutBroadcasterAdmin() public view {
+        assertEq(escrow.owner(), owner);
+        assertEq(escrow.pendingOwner(), address(0));
+        assertTrue(escrow.isCollateralAllowed(address(usdc)));
+        assertTrue(escrow.isAttester(attester));
+        (uint256 per, uint256 daily,,) = escrow.tokenCaps(address(usdc));
+        assertEq(per, 100_000_000);
+        assertEq(daily, 1_000_000_000);
+    }
+
+    function test_constructor_rejectsUnlimitedCapsAndSharedOwnerAttester() public {
+        vm.expectRevert(CollateralEscrow.InvalidCaps.selector);
+        new CollateralEscrow(owner, address(usdc), attester, 0, 1_000_000, 1 days);
+        vm.expectRevert(CollateralEscrow.InvalidCaps.selector);
+        new CollateralEscrow(owner, address(usdc), attester, 2_000_000, 1_000_000, 1 days);
+        vm.expectRevert(CollateralEscrow.OwnerIsAttester.selector);
+        new CollateralEscrow(owner, address(usdc), owner, 1_000_000, 1_000_000, 1 days);
+        vm.expectRevert(CollateralEscrow.ZeroTtl.selector);
+        new CollateralEscrow(owner, address(usdc), attester, 1_000_000, 1_000_000, 0);
+    }
+
+    function test_seizureCannotBeEnabledOrConsumeReleaseId() public {
+        _deposit(depositor, 5_000_000);
+        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 1_000_000, 20);
+        vm.prank(owner);
+        (bool enabled,) = address(escrow).call(abi.encodeWithSignature("setSeizer(address,bool)", owner, true));
+        assertFalse(enabled);
+        vm.prank(owner);
+        (bool seized,) = address(escrow)
+            .call(
+                abi.encodeWithSignature(
+                    "seize((address,address,uint256,address,uint256,uint256))",
+                    depositor,
+                    address(usdc),
+                    1,
+                    owner,
+                    20,
+                    block.timestamp + 1 days
+                )
+            );
+        assertFalse(seized);
+        assertFalse(escrow.consumed(20));
+        escrow.withdrawWithAttestation(r, sig);
+        assertEq(usdc.balanceOf(depositor), 1_000_000);
+    }
+
+    function test_caps_tokensWithDifferentDecimalsHaveIndependentBudgets() public {
+        ERC20 token18 = new MockToken18();
+        vm.startPrank(owner);
+        escrow.setTokenCaps(address(usdc), 2_000_000, 2_000_000);
+        escrow.setTokenCaps(address(token18), 2 ether, 2 ether);
+        escrow.setCollateralAllowed(address(token18), true);
+        vm.stopPrank();
+        _deposit(depositor, 2_000_000);
+        MockToken18(address(token18)).mint(depositor, 2 ether);
+        vm.startPrank(depositor);
+        token18.approve(address(escrow), 2 ether);
+        escrow.deposit(address(token18), 2 ether);
+        vm.stopPrank();
+        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 2_000_000, 80);
+        escrow.withdrawWithAttestation(r, sig);
+        r.token = address(token18);
+        r.amount = 2 ether;
+        r.attestationId = 81;
+        escrow.withdrawWithAttestation(r, _signRelease(attesterKey, r));
+        (,,, uint256 usdcReleased) = escrow.tokenCaps(address(usdc));
+        (,,, uint256 tokenReleased) = escrow.tokenCaps(address(token18));
+        assertEq(usdcReleased, 2_000_000);
+        assertEq(tokenReleased, 2 ether);
+    }
+
+    function test_caps_updateDoesNotResetSpentBudget() public {
+        _deposit(depositor, 10_000_000);
+        vm.prank(owner);
+        escrow.setTokenCaps(address(usdc), 3_000_000, 3_000_000);
+        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 2_000_000, 90);
+        escrow.withdrawWithAttestation(r, sig);
+        vm.prank(owner);
+        escrow.setTokenCaps(address(usdc), 3_000_000, 3_000_000);
+        (r, sig) = _releaseFor(depositor, 2_000_000, 91);
+        vm.expectRevert(CollateralEscrow.DailyReleaseLimitExceeded.selector);
+        escrow.withdrawWithAttestation(r, sig);
+    }
+
+    function test_disablingDepositsDoesNotStrandSignedWithdrawal() public {
+        _deposit(depositor, 1_000_000);
+        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 1_000_000, 100);
+        vm.prank(owner);
+        escrow.setCollateralAllowed(address(usdc), false);
+        escrow.withdrawWithAttestation(r, sig);
+        assertEq(usdc.balanceOf(depositor), 1_000_000);
+    }
+
+    function test_admin_attesterCannotAcceptOwnership() public {
+        vm.prank(owner);
+        escrow.transferOwnership(attester);
+        vm.prank(attester);
+        vm.expectRevert(CollateralEscrow.OwnerIsAttester.selector);
+        escrow.acceptOwnership();
+        assertEq(escrow.owner(), owner);
+    }
+
+    function test_admin_cannotEnableOwnerAsAttester() public {
+        vm.prank(owner);
+        vm.expectRevert(CollateralEscrow.OwnerIsAttester.selector);
+        escrow.setAttester(owner, true);
+    }
+
+    function test_releaseCannotBeRetargetedToReplacementEscrow() public {
+        _deposit(depositor, 1_000_000);
+        (CollateralEscrow.CollateralRelease memory r, bytes memory sig) = _releaseFor(depositor, 1_000_000, 110);
+        CollateralEscrow replacement =
+            new CollateralEscrow(owner, address(usdc), attester, 100_000_000, 1_000_000_000, 30 days);
+        usdc.mint(address(replacement), 1_000_000);
+        vm.expectRevert(CollateralEscrow.InvalidAttester.selector);
+        replacement.withdrawWithAttestation(r, sig);
+        assertFalse(replacement.consumed(110));
+        escrow.withdrawWithAttestation(r, sig);
+        assertEq(usdc.balanceOf(depositor), 1_000_000);
+    }
+
+    function test_admin_allowlistRequiresTokenCaps() public {
+        MockToken18 token = new MockToken18();
+        vm.prank(owner);
+        vm.expectRevert(CollateralEscrow.InvalidCaps.selector);
+        escrow.setCollateralAllowed(address(token), true);
+    }
+
+    function test_caps_cannotBeDisabledAfterDeployment() public {
+        vm.prank(owner);
+        vm.expectRevert(CollateralEscrow.InvalidCaps.selector);
+        escrow.setTokenCaps(address(usdc), 0, 0);
     }
 }

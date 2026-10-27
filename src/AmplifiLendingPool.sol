@@ -9,6 +9,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 enum PoolStatus {
     Active,
@@ -33,7 +36,7 @@ function shareSymbol(address asset) view returns (string memory) {
     return string.concat("a", IERC20Metadata(asset).symbol());
 }
 
-contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
+contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step, EIP712 {
     using SafeERC20 for IERC20;
 
     // ── Immutables ──────────────────────────────────────────────────────
@@ -47,6 +50,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     PoolStatus public status;
     uint256 public totalBorrowAssets;
     uint256 public totalBorrowShares;
+    uint256 public borrowIndex = 1e27;
     uint256 public lastAccrualTimestamp;
 
     // ── Loan tracking ─────────────────────────────────────────────────
@@ -104,10 +108,30 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // Cumulative bad debt realized across all loans, a cheap on-chain counter for
     // monitoring/alerting on write-offs (the per-loan BadDebtRealized event still fires).
     uint256 public totalBadDebtRealized;
+    bool public borrowPaused = true;
+    address public settlementSigner;
+    mapping(uint256 nonce => bool used) public usedSettlementNonces;
+    mapping(uint256 loanId => bool issued) public loanIssued;
+
+    bytes32 public constant LOSS_SETTLEMENT_TYPEHASH = keccak256(
+        "LossSettlement(uint256 loanId,address wallet,uint256 amount,uint256 maxWriteOff,uint256 nonce,uint256 deadline)"
+    );
+    bytes32 private constant REPAY_WALLET_SLOT = keccak256("amplifi.repay.wallet");
+    bytes32 private constant REPAY_LOAN_SLOT = keccak256("amplifi.repay.loan");
+    bytes32 private constant REPAY_BALANCE_SLOT = keccak256("amplifi.repay.balance");
+
+    struct Payment {
+        address wallet;
+        uint256 credited;
+        uint256 interestPaid;
+        uint256 principalPaid;
+        uint256 burnedShares;
+    }
 
     // ── Constants ───────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
+    uint256 private constant RAY = 1e27;
     // Hard ceiling on maxRateBps (10,000% APR). Prevents the rate-spike drain path
     // where an owner with one share inflates totalBorrowAssets, rounds withdraw share
     // cost down to 1, and burns 1 share for the whole pool.
@@ -123,6 +147,22 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event Borrow(uint256 indexed loanId, address indexed wallet, uint256 amount, uint256 shares);
     event Repay(uint256 indexed loanId, address indexed wallet, uint256 repaid, uint256 shares);
     event BadDebtRealized(uint256 indexed loanId, uint256 badDebt);
+    event RepaymentApplied(
+        uint256 indexed loanId,
+        address indexed wallet,
+        uint256 received,
+        uint256 principalPaid,
+        uint256 interestPaid,
+        uint256 remainingPrincipal,
+        uint256 remainingDebt
+    );
+    event RepaymentRefunded(uint256 indexed loanId, address indexed wallet, uint256 amount);
+    event LoanWrittenOff(
+        uint256 indexed loanId, uint256 principalWrittenOff, uint256 interestWrittenOff, uint256 remainingDebt
+    );
+    event SettlementSignerUpdated(address indexed signer);
+    event BorrowPausedUpdated(bool paused);
+    event DebtRoundingAdjustment(uint256 indexed loanId, uint256 amount);
     event InterestAccrued(uint256 interest, uint256 newTotalBorrowAssets);
     event TeeOperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event RateParamsUpdated(uint256 baseRateBps, uint256 kinkUtilizationBps, uint256 kinkRateBps, uint256 maxRateBps);
@@ -138,6 +178,14 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
+    error BorrowPaused();
+    error RepaymentInProgress();
+    error RepaymentNotStarted();
+    error RepaymentAmountMismatch();
+    error RepaymentTooSmall();
+    error InsufficientRepayment();
+    error InvalidSettlementPermit();
+    error WriteOffLimitExceeded();
     error OnlyBorrowerWallet();
     error PoolNotActive();
     error InsufficientLiquidity();
@@ -156,6 +204,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error FeeExceedsAccrued();
 
     // ── Modifiers ───────────────────────────────────────────────────────
+    modifier noActiveRepayment() {
+        if (_transientRead(REPAY_WALLET_SLOT) != 0) revert RepaymentInProgress();
+        _;
+    }
+
     modifier onlyTeeOperator() {
         if (msg.sender != teeOperator) revert OnlyTeeOperator();
         _;
@@ -176,7 +229,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 _kinkRateBps,
         uint256 _maxRateBps,
         address[] memory _depositors
-    ) ERC20(shareName(_usdc), shareSymbol(_usdc)) Ownable(_owner) {
+    ) ERC20(shareName(_usdc), shareSymbol(_usdc)) Ownable(_owner) EIP712("AmplifiLendingPool", "2") {
         // A zero asset already reverted in shareName, before this body ran.
         if (_teeOperator == address(0)) revert ZeroAddress();
         usdc = IERC20(_usdc);
@@ -214,7 +267,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         return deposit(assets, msg.sender);
     }
 
-    function deposit(uint256 assets, address receiver) public nonReentrant whenActive returns (uint256 shares) {
+    function deposit(uint256 assets, address receiver)
+        public
+        nonReentrant
+        noActiveRepayment
+        whenActive
+        returns (uint256 shares)
+    {
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
         _checkDepositor(msg.sender, receiver);
@@ -229,7 +288,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Deposit(msg.sender, receiver, assets, shares);
     }
 
-    function mint(uint256 shares, address receiver) external nonReentrant whenActive returns (uint256 assets) {
+    function mint(uint256 shares, address receiver)
+        external
+        nonReentrant
+        noActiveRepayment
+        whenActive
+        returns (uint256 assets)
+    {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
         _checkDepositor(msg.sender, receiver);
@@ -253,7 +318,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     ///         assets to msg.sender. WARNING: this overload takes SHARES, NOT assets, it is
     ///         NOT the ERC-4626 `withdraw(assets,...)`. To withdraw a specific ASSET amount use
     ///         `withdrawAssets(assets)` or the 3-arg `withdraw(assets, receiver, owner)`.
-    function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
+    function withdraw(uint256 shares) external nonReentrant noActiveRepayment returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         accrueInterest();
 
@@ -267,7 +332,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, msg.sender, msg.sender, assets, shares);
     }
 
-    function withdraw(uint256 assets, address receiver, address _owner) external nonReentrant returns (uint256 shares) {
+    function withdraw(uint256 assets, address receiver, address _owner)
+        external
+        nonReentrant
+        noActiveRepayment
+        returns (uint256 shares)
+    {
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -286,7 +356,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, receiver, _owner, assets, shares);
     }
 
-    function redeem(uint256 shares, address receiver, address _owner) external nonReentrant returns (uint256 assets) {
+    function redeem(uint256 shares, address receiver, address _owner)
+        external
+        nonReentrant
+        noActiveRepayment
+        returns (uint256 assets)
+    {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -305,7 +380,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     /// @notice Backward-compat. Takes assets, burns shares from msg.sender, sends to msg.sender.
-    function withdrawAssets(uint256 assets) external nonReentrant returns (uint256 shares) {
+    function withdrawAssets(uint256 assets) external nonReentrant noActiveRepayment returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
         accrueInterest();
 
@@ -327,10 +402,17 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     ///         the repayment to this pool and calling repay() (see repay()). Caller
     ///         (teeOperator) is trusted to pass the wallet that posted collateral for
     ///         this loan.
-    function borrow(uint256 loanId, uint256 amount, address wallet) external nonReentrant onlyTeeOperator whenActive {
+    function borrow(uint256 loanId, uint256 amount, address wallet)
+        external
+        nonReentrant
+        noActiveRepayment
+        onlyTeeOperator
+        whenActive
+    {
+        if (borrowPaused) revert BorrowPaused();
         if (amount == 0) revert ZeroAmount();
         if (wallet == address(0)) revert ZeroAddress();
-        if (loanShares[loanId] != 0) revert LoanAlreadyExists();
+        if (loanIssued[loanId]) revert LoanAlreadyExists();
 
         _enforceBorrowControls(wallet, amount);
 
@@ -339,74 +421,213 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (amount > availableLiquidity()) revert InsufficientLiquidity();
 
         uint256 shares = _borrowSharesToMint(amount);
+        loanIssued[loanId] = true;
         loanShares[loanId] = shares;
         loanWallet[loanId] = wallet;
         loanPrincipal[loanId] = amount;
         totalBorrowShares += shares;
-        totalBorrowAssets += amount;
+        uint256 previousAssets = totalBorrowAssets;
+        totalBorrowAssets = _debtAtIndex(totalBorrowShares, borrowIndex);
+        uint256 roundingGain = totalBorrowAssets - previousAssets - amount;
+        if (roundingGain != 0) emit DebtRoundingAdjustment(loanId, roundingGain);
 
         usdc.safeTransfer(wallet, amount);
 
         emit Borrow(loanId, wallet, amount, shares);
     }
 
-    /// @notice Repay a loan. PUSH-based: the loan's borrower wallet transfers the
-    ///         repayment pUSD to this pool and then calls repay, both in the SAME
-    ///         atomic transaction (a Polymarket relayer WALLET batch). Nothing is
-    ///         pulled here: a `transferFrom` would need the wallet to `approve` this
-    ///         pool, and Polymarket's relayer permanently blocks a deposit wallet
-    ///         approving any non-Polymarket spender (drain protection), so the pull
-    ///         model is impossible. The pushed pUSD is already in this pool's
-    ///         balance, and therefore already in availableLiquidity()/totalAssets(),
-    ///         since idle liquidity is measured by balanceOf, so accounting stays
-    ///         exactly as before; repay only settles the loan bookkeeping.
-    /// @dev Gated to the loan's own wallet (`loanWallet[loanId]`), which is an
-    ///      amplifi-server-controlled deposit wallet, no external party can call it.
-    ///      This is the same trust boundary as the previous `onlyTeeOperator` gate:
-    ///      the caller is trusted to have pushed `amount` pUSD in the same batch, just
-    ///      as the operator was trusted to have set an approval. A relayer batch is
-    ///      all-or-nothing (it reverts as a unit if any call, incl. the transfer,
-    ///      would fail), so repay cannot execute without its paired push.
-    /// @param amount The pUSD the wallet pushed for this repayment. The loan is
-    ///        credited min(amount, debt); a shortfall (amount < debt, e.g. an
-    ///        under-collateralized liquidation) is written off as bad debt absorbed
-    ///        by lenders via reduced share price. Callers push exactly what they
-    ///        intend to credit (full debt, or the recovered proceeds on a
-    ///        liquidation); any excess over the debt stays as pool liquidity.
-    function repay(uint256 loanId, uint256 amount) external nonReentrant {
-        uint256 shares = loanShares[loanId];
-        if (shares == 0) revert LoanNotFound();
-        address wallet = loanWallet[loanId];
-        if (msg.sender != wallet) revert OnlyBorrowerWallet();
+    function repaymentVersion() external pure returns (uint256) {
+        return 2;
+    }
 
+    /// @notice First call in the wallet's atomic [begin, transfer, repay] batch.
+    function beginRepay(uint256 loanId) external nonReentrant noActiveRepayment {
+        if (loanShares[loanId] == 0) revert LoanNotFound();
+        if (msg.sender != loanWallet[loanId]) revert OnlyBorrowerWallet();
         accrueInterest();
+        _transientWrite(REPAY_WALLET_SLOT, uint256(uint160(msg.sender)));
+        _transientWrite(REPAY_LOAN_SLOT, loanId);
+        _transientWrite(REPAY_BALANCE_SLOT, usdc.balanceOf(address(this)));
+    }
 
+    /// @notice Credit received funds, interest first; an unpaid balance stays open.
+    function repay(uint256 loanId, uint256 amount) external nonReentrant returns (uint256 remainingDebt) {
+        if (amount == 0) revert ZeroAmount();
+        _verifyRepayment(loanId, amount);
+        remainingDebt = _applyRepayment(loanId, amount);
+    }
+
+    /// @notice A close must remain fully funded when mined; excess is refunded.
+    function repayFull(uint256 loanId, uint256 amount) external nonReentrant returns (uint256 remainingDebt) {
+        _verifyRepayment(loanId, amount);
+        if (amount < _borrowAssetsOwed(loanShares[loanId])) revert InsufficientRepayment();
+        remainingDebt = _applyRepayment(loanId, amount);
+    }
+
+    function settleLoss(
+        uint256 loanId,
+        uint256 amount,
+        uint256 maxWriteOff,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external nonReentrant {
+        _verifyRepayment(loanId, amount);
+        _authorizeLossSettlement(loanId, amount, maxWriteOff, nonce, deadline, signature);
+        _settleAuthorizedLoss(loanId, amount, maxWriteOff);
+    }
+
+    function _authorizeLossSettlement(
+        uint256 loanId,
+        uint256 amount,
+        uint256 maxWriteOff,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) internal {
+        if (
+            block.timestamp > deadline || usedSettlementNonces[nonce] || settlementSigner == address(0)
+                || settlementSigner == msg.sender
+        ) revert InvalidSettlementPermit();
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(abi.encode(LOSS_SETTLEMENT_TYPEHASH, loanId, msg.sender, amount, maxWriteOff, nonce, deadline))
+        );
+        if (ECDSA.recover(digest, signature) != settlementSigner) revert InvalidSettlementPermit();
+        usedSettlementNonces[nonce] = true;
+    }
+
+    function _settleAuthorizedLoss(uint256 loanId, uint256 amount, uint256 maxWriteOff) internal {
+        uint256 debt = _borrowAssetsOwed(loanShares[loanId]);
+        if (amount >= debt) {
+            _applyRepayment(loanId, amount);
+        } else {
+            if (debt - amount > maxWriteOff) revert WriteOffLimitExceeded();
+            _settleLoss(loanId, amount, debt);
+        }
+    }
+
+    /// @notice Exceptional loss recognition when the recorded borrower cannot settle.
+    function writeOff(uint256 loanId, uint256 maxWriteOff) external onlyOwner nonReentrant noActiveRepayment {
+        if (loanShares[loanId] == 0) revert LoanNotFound();
+        accrueInterest();
+        uint256 debt = _borrowAssetsOwed(loanShares[loanId]);
+        if (debt > maxWriteOff) revert WriteOffLimitExceeded();
+        _writeOff(loanId, debt);
+    }
+
+    function _verifyRepayment(uint256 loanId, uint256 amount) internal {
+        if (loanShares[loanId] == 0) revert LoanNotFound();
+        if (msg.sender != loanWallet[loanId]) revert OnlyBorrowerWallet();
+        if (
+            _transientRead(REPAY_WALLET_SLOT) != uint256(uint160(msg.sender))
+                || _transientRead(REPAY_LOAN_SLOT) != loanId
+        ) revert RepaymentNotStarted();
+        uint256 balance = usdc.balanceOf(address(this));
+        uint256 beforeBalance = _transientRead(REPAY_BALANCE_SLOT);
+        if (balance < beforeBalance || balance - beforeBalance != amount) revert RepaymentAmountMismatch();
+        _transientWrite(REPAY_WALLET_SLOT, 0);
+        _transientWrite(REPAY_LOAN_SLOT, 0);
+        _transientWrite(REPAY_BALANCE_SLOT, 0);
+    }
+
+    function _applyRepayment(uint256 loanId, uint256 received) internal returns (uint256 remainingDebt) {
+        uint256 shares = loanShares[loanId];
         uint256 debt = _borrowAssetsOwed(shares);
-        uint256 repaid = debt < amount ? debt : amount;
-        uint256 badDebt = debt - repaid;
-        uint256 principal = loanPrincipal[loanId];
+        Payment memory payment;
+        payment.wallet = loanWallet[loanId];
+        payment.credited = Math.min(received, debt);
+        if (payment.credited != 0 && payment.credited < debt) {
+            payment.burnedShares = Math.mulDiv(payment.credited, RAY, borrowIndex);
+            if (payment.burnedShares == 0) revert RepaymentTooSmall();
+            payment.credited = _debtAtIndex(payment.burnedShares, borrowIndex);
+        }
+        payment.interestPaid = Math.min(payment.credited, debt - loanPrincipal[loanId]);
+        payment.principalPaid = payment.credited - payment.interestPaid;
+        if (payment.credited == debt) {
+            payment.burnedShares = shares;
+            delete loanShares[loanId];
+            delete loanWallet[loanId];
+            delete loanPrincipal[loanId];
+        } else if (payment.credited != 0) {
+            loanShares[loanId] -= payment.burnedShares;
+            loanPrincipal[loanId] -= payment.principalPaid;
+        }
+        totalBorrowShares -= payment.burnedShares;
+        {
+            uint256 previousAssets = totalBorrowAssets;
+            totalBorrowAssets = _debtAtIndex(totalBorrowShares, borrowIndex);
+            uint256 roundingGain = payment.credited - (previousAssets - totalBorrowAssets);
+            if (roundingGain != 0) emit DebtRoundingAdjustment(loanId, roundingGain);
+        }
+        if (totalBorrowShares == 0) borrowIndex = RAY;
+        if (loanShares[loanId] != 0) remainingDebt = _borrowAssetsOwed(loanShares[loanId]);
+        if (payment.interestPaid != 0 && feeBps != 0) {
+            uint256 fee = Math.mulDiv(payment.interestPaid, feeBps, BPS);
+            protocolFeesAccrued += fee;
+            emit ProtocolFeeAccrued(loanId, payment.interestPaid, fee);
+        }
+        emit Repay(loanId, payment.wallet, payment.credited, payment.burnedShares);
+        emit RepaymentApplied(
+            loanId,
+            payment.wallet,
+            payment.credited,
+            payment.principalPaid,
+            payment.interestPaid,
+            loanPrincipal[loanId],
+            remainingDebt
+        );
+        if (received > payment.credited) {
+            uint256 refund = received - payment.credited;
+            usdc.safeTransfer(payment.wallet, refund);
+            emit RepaymentRefunded(loanId, payment.wallet, refund);
+        }
+    }
 
+    function _writeOff(uint256 loanId, uint256 debt) internal {
+        uint256 principal = loanPrincipal[loanId];
+        totalBorrowShares -= loanShares[loanId];
+        uint256 previousAssets = totalBorrowAssets;
+        totalBorrowAssets = _debtAtIndex(totalBorrowShares, borrowIndex);
+        uint256 roundingGain = debt - (previousAssets - totalBorrowAssets);
+        if (roundingGain != 0) emit DebtRoundingAdjustment(loanId, roundingGain);
+        if (totalBorrowShares == 0) borrowIndex = RAY;
+        totalBadDebtRealized += debt;
         delete loanShares[loanId];
         delete loanWallet[loanId];
         delete loanPrincipal[loanId];
+        emit BadDebtRealized(loanId, debt);
+        emit LoanWrittenOff(loanId, principal, debt - principal, 0);
+    }
+
+    function _settleLoss(uint256 loanId, uint256 received, uint256 debt) internal {
+        address wallet = loanWallet[loanId];
+        uint256 interestPaid = Math.min(received, debt - loanPrincipal[loanId]);
+        uint256 principalPaid = received - interestPaid;
+        uint256 remainingPrincipal = loanPrincipal[loanId] - principalPaid;
+        uint256 loss = debt - received;
+        uint256 shares = loanShares[loanId];
+        uint256 previousAssets = totalBorrowAssets;
         totalBorrowShares -= shares;
-        totalBorrowAssets -= debt;
+        totalBorrowAssets = _debtAtIndex(totalBorrowShares, borrowIndex);
+        uint256 roundingGain = debt - (previousAssets - totalBorrowAssets);
+        if (roundingGain != 0) emit DebtRoundingAdjustment(loanId, roundingGain);
+        if (totalBorrowShares == 0) borrowIndex = RAY;
+        totalBadDebtRealized += loss;
+        delete loanShares[loanId];
+        delete loanWallet[loanId];
+        delete loanPrincipal[loanId];
+        emit Repay(loanId, wallet, received, shares);
+        emit RepaymentApplied(loanId, wallet, received, principalPaid, interestPaid, remainingPrincipal, loss);
+        emit BadDebtRealized(loanId, loss);
+        emit LoanWrittenOff(loanId, remainingPrincipal, loss - remainingPrincipal, 0);
+    }
 
-        // No transferFrom, the wallet pushed the repayment to this pool in the same
-        // atomic batch immediately before calling repay (see @notice).
+    function _transientRead(bytes32 slot) internal view returns (uint256 value) {
+        assembly { value := tload(slot) }
+    }
 
-        emit Repay(loanId, wallet, repaid, shares);
-        if (badDebt > 0) {
-            totalBadDebtRealized += badDebt;
-            emit BadDebtRealized(loanId, badDebt);
-        } else if (feeBps > 0) {
-            uint256 interest = debt > principal ? debt - principal : 0;
-            uint256 fee = (interest * feeBps) / BPS;
-            if (fee > 0) {
-                protocolFeesAccrued += fee;
-                emit ProtocolFeeAccrued(loanId, interest, fee);
-            }
-        }
+    function _transientWrite(bytes32 slot, uint256 value) internal {
+        assembly { tstore(slot, value) }
     }
 
     // ── Interest ────────────────────────────────────────────────────────
@@ -415,15 +636,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
         if (elapsed == 0) return;
 
+        uint256 nextIndex = _pendingBorrowIndex();
         lastAccrualTimestamp = block.timestamp;
-
-        if (totalBorrowAssets == 0) return;
-
-        uint256 rate = borrowRate();
-        uint256 interest = (totalBorrowAssets * rate * elapsed) / (BPS * SECONDS_PER_YEAR);
-
+        uint256 nextAssets = _debtAtIndex(totalBorrowShares, nextIndex);
+        uint256 interest = nextAssets - totalBorrowAssets;
+        borrowIndex = nextIndex;
+        totalBorrowAssets = nextAssets;
         if (interest > 0) {
-            totalBorrowAssets += interest;
             emit InterestAccrued(interest, totalBorrowAssets);
         }
     }
@@ -441,8 +660,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     function loanDebt(uint256 loanId) external view returns (uint256) {
         uint256 shares = loanShares[loanId];
         if (shares == 0) return 0;
-        uint256 adjustedAssets = totalBorrowAssets + _pendingInterest();
-        return (shares * adjustedAssets + totalBorrowShares - 1) / totalBorrowShares;
+        return _debtAtIndex(shares, _pendingBorrowIndex());
     }
 
     function totalAssets() public view returns (uint256) {
@@ -468,7 +686,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function sharesToAssets(uint256 shares) public view returns (uint256) {
-        return (shares * (totalAssets() + VIRTUAL_ASSETS)) / (totalSupply() + VIRTUAL_SHARES);
+        uint256 assets = totalAssets();
+        uint256 supply = totalSupply();
+        uint256 quoted = (shares * (assets + VIRTUAL_ASSETS)) / (supply + VIRTUAL_SHARES);
+        // Virtual offsets can overquote the final settled redemption after a loss.
+        if (shares != 0 && shares == supply && totalBorrowShares == 0) return Math.min(quoted, assets);
+        return quoted;
     }
 
     function assetsToShares(uint256 assets) public view returns (uint256) {
@@ -493,7 +716,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     function maxRedeem(address _owner) external view returns (uint256) {
         uint256 ownerShares = balanceOf(_owner);
-        uint256 liquidityShares = assetsToShares(availableLiquidity());
+        uint256 liquidity = availableLiquidity();
+        if (ownerShares != 0 && ownerShares == totalSupply() && totalBorrowShares == 0 && liquidity != 0) {
+            return ownerShares;
+        }
+        uint256 liquidityShares = assetsToShares(liquidity);
         return ownerShares < liquidityShares ? ownerShares : liquidityShares;
     }
 
@@ -526,6 +753,16 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     // ── Admin Functions ─────────────────────────────────────────────────
+
+    function setSettlementSigner(address signer) external onlyOwner {
+        settlementSigner = signer;
+        emit SettlementSignerUpdated(signer);
+    }
+
+    function setBorrowPaused(bool paused) external onlyOwner {
+        borrowPaused = paused;
+        emit BorrowPausedUpdated(paused);
+    }
 
     function setTeeOperator(address _teeOperator) external onlyOwner {
         if (_teeOperator == address(0)) revert ZeroAddress();
@@ -631,11 +868,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         feeRecipient = _feeRecipient;
     }
 
-    function collectProtocolFees(address to, uint256 amount) external nonReentrant {
+    function collectProtocolFees(address to, uint256 amount) external nonReentrant noActiveRepayment {
         if (msg.sender != owner() && msg.sender != feeRecipient) revert OnlyOwnerOrFeeRecipient();
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (amount > protocolFeesAccrued) revert FeeExceedsAccrued();
+        accrueInterest();
         protocolFeesAccrued -= amount;
         usdc.safeTransfer(to, amount);
         emit ProtocolFeesCollected(to, amount);
@@ -682,26 +920,34 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     /// @dev Convert borrow assets to shares. Rounds UP (favors protocol on borrow).
     function _borrowSharesToMint(uint256 assets) internal view returns (uint256) {
-        if (totalBorrowShares == 0 || totalBorrowAssets == 0) {
-            return assets; // 1:1 when pool is empty
-        }
-        return (assets * totalBorrowShares + totalBorrowAssets - 1) / totalBorrowAssets;
+        return Math.mulDiv(assets, RAY, borrowIndex, Math.Rounding.Ceil);
     }
 
-    /// @dev Convert borrow shares to assets (debt). Rounds UP (favors protocol on repay).
+    /// @dev Loan debt uses a monotonic index so another loan's payment cannot reduce it.
     function _borrowAssetsOwed(uint256 shares) internal view returns (uint256) {
-        if (totalBorrowShares == 0) return 0;
-        return (shares * totalBorrowAssets + totalBorrowShares - 1) / totalBorrowShares;
+        return _debtAtIndex(shares, borrowIndex);
     }
 
     function _pendingInterest() internal view returns (uint256) {
-        return _pendingInterestAtRate(borrowRate());
+        return _debtAtIndex(totalBorrowShares, _pendingBorrowIndex()) - totalBorrowAssets;
     }
 
     function _pendingInterestAtRate(uint256 rate) internal view returns (uint256) {
+        return _debtAtIndex(totalBorrowShares, _indexAtRate(rate)) - totalBorrowAssets;
+    }
+
+    function _pendingBorrowIndex() internal view returns (uint256) {
+        return _indexAtRate(_borrowRateAtUtilization(_utilizationWithBorrowAssets(totalBorrowAssets)));
+    }
+
+    function _indexAtRate(uint256 rate) internal view returns (uint256) {
+        if (totalBorrowShares == 0) return borrowIndex;
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
-        if (elapsed == 0 || totalBorrowAssets == 0) return 0;
-        return (totalBorrowAssets * rate * elapsed) / (BPS * SECONDS_PER_YEAR);
+        return borrowIndex + Math.mulDiv(borrowIndex, rate * elapsed, BPS * SECONDS_PER_YEAR);
+    }
+
+    function _debtAtIndex(uint256 shares, uint256 index) internal pure returns (uint256) {
+        return Math.mulDiv(shares, index, RAY, Math.Rounding.Ceil);
     }
 
     function _utilizationWithBorrowAssets(uint256 borrowAssets) internal view returns (uint256) {
